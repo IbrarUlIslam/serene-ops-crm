@@ -291,7 +291,12 @@ async function handleDbBlobRequest(e, r, t) {
   return errorResponse("Method not allowed", 405);
 }
 __name(handleDbBlobRequest, "handleDbBlobRequest");
-var ALLOWED_ORIGINS = /* @__PURE__ */ new Set(["https://crm.sereneop.com"]);
+// TEMPORARY, for the Zoom Phone Smart Embed test only: adds the exact
+// stable branch-preview hostname for zoom-zoho-integration so it can call
+// this same production Worker while testing. Exact-origin only, no
+// wildcard, no broad *.pages.dev allowance. Remove after the phone test
+// (or once merged) -- see the commit that added this line.
+var ALLOWED_ORIGINS = /* @__PURE__ */ new Set(["https://crm.sereneop.com", "https://zoom-zoho-integration.serene-ops-crm.pages.dev"]);
 function corsHeaders(e) {
   const r = e.headers.get("Origin");
   return r && ALLOWED_ORIGINS.has(r) ? { "Access-Control-Allow-Origin": r, "Access-Control-Allow-Credentials": "true", "Access-Control-Allow-Headers": "Content-Type, Cf-Access-Jwt-Assertion", "Access-Control-Allow-Methods": "GET, POST, PATCH, PUT, DELETE, OPTIONS", Vary: "Origin" } : {};
