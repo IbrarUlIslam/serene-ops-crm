@@ -1988,7 +1988,7 @@ async function handleZohoReplyOrForward(request, env, user, messageId) {
       payload.attachments = body.attachmentIds.map(function(id) { return { storeName: "reserved", attachmentPath: id }; });
     }
     const result = await zohoApiFetch(env, user.orgId, `/api/accounts/${row.zoho_account_id}/messages/${messageId}`, { method: "POST", json: payload });
-    if (!result.ok) return errorResponse("Zoho reply/forward failed: " + JSON.stringify(result.body).slice(0, 300), 502);
+    if (!result.ok) { console.log("ZOHO_FWD_ERR", result.status, JSON.stringify(result.body)); return errorResponse("Zoho reply/forward failed: " + JSON.stringify(result.body).slice(0, 300), 502); }
     const rfData = (result.body && result.body.data) || { ok: true };
     await recordZohoSendAttribution(env, user.orgId, user.email || user.id || null, body.contactId || null, null, rfData);
     return json({ data: rfData });
