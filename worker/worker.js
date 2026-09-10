@@ -2311,7 +2311,7 @@ var worker_default = { async fetch(e, r, t) {
   // staging frontend and its API share one origin (crm.sereneop.com's
   // production frontend is untouched -- it still comes from the Pages
   // custom domain, not this Worker).
-  if (_stagingUrl.hostname === "staging-crm.sereneop.com" && !s.startsWith("/api/")) {
+  if (_stagingUrl.hostname === "staging-crm.sereneop.com" && !s.startsWith("/api/") && !s.startsWith("/cdn-cgi/")) {
     return proxyStagingFrontend(e, _stagingUrl);
   }
   if (!s.startsWith("/api/")) return errorResponse("Not found", 404);
