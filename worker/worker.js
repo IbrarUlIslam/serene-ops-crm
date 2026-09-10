@@ -264,56 +264,48 @@ function meResponse(e, r) {
 }
 __name(meResponse, "meResponse");
 function mergeZoomMeetings(existingMeetings, zoomRows) {
-  // Overlays live Zoom-sourced fields from zoom_crm_meetings onto whatever
-  // the client already has for that meeting, so a client's own edits
-  // (contact/deal link, internal notes, archive, or a manual summary
-  // override) survive, while the Zoom-owned fields (topic, host, status,
-  // times, and the AI Companion summary unless the user overrode it with
-  // their own) are always the freshest real data, read directly from a
-  // dedicated table rather than depending on any client ever having saved
-  // them into crm_snapshot.
+  // zoom_crm_meetings is the SOLE authoritative owner of a Zoom meeting's
+  // entire record -- both the Zoom-sourced fields (topic, host, status,
+  // times, AI Companion summary) and the user-editable ones (contact/deal
+  // link, internal notes, archive; a manual summary override sets
+  // summary_source='manual' server-side and is respected by
+  // reconcileMeetingSummary). crm_snapshot PUT strips zoom-tagged meetings
+  // before saving (see handleDbBlobRequest), so the blob should never
+  // legitimately contain one; any that slip through anyway (e.g. from a
+  // client running older cached JS) are dropped here rather than trusted,
+  // so there is exactly one place these fields can ever be written.
   const list = Array.isArray(existingMeetings) ? existingMeetings : [];
-  const byZoomId = {};
-  for (const m of list) {
-    if (m && m.zoom_meeting_id) byZoomId[m.zoom_meeting_id] = m;
-  }
   const nonZoom = list.filter(function(m) { return !(m && m.zoom_meeting_id); });
-  const merged = [];
-  for (const row of zoomRows) {
-    const prior = byZoomId[row.zoom_meeting_id];
-    const m = prior ? Object.assign({}, prior) : {
+  const merged = zoomRows.map(function(row) {
+    return {
       id: row.id,
       kind: null,
       attendees: [],
-      matched_contact_id: null,
-      contact_id: null,
-      matched_deal_id: null,
-      match_state: "unmatched",
-      internal_notes: null,
-      archived_at: null
+      zoom_meeting_id: row.zoom_meeting_id,
+      zoom_uuid: row.zoom_uuid,
+      zoom_topic: row.zoom_topic,
+      zoom_host: row.zoom_host,
+      zoom_status: row.zoom_status,
+      at: row.at,
+      timezone: row.timezone,
+      meeting_duration_seconds: row.meeting_duration_seconds,
+      meeting_ended_at: row.meeting_ended_at,
+      assignee: row.assignee || "Unassigned",
+      matched_contact_id: row.matched_contact_id || null,
+      contact_id: row.matched_contact_id || null,
+      matched_deal_id: row.matched_deal_id || null,
+      match_state: row.match_state || "unmatched",
+      internal_notes: row.internal_notes || null,
+      archived_at: row.archived_at || null,
+      summary_status: row.summary_status,
+      summary_source: row.summary_source,
+      summary_overview: row.summary_overview,
+      summary_text: row.summary_text,
+      summary_details: row.summary_details ? JSON.parse(row.summary_details) : [],
+      summary_next_steps: row.summary_next_steps ? JSON.parse(row.summary_next_steps) : [],
+      summary_created_at: row.summary_created_at
     };
-    m.id = m.id || row.id;
-    m.zoom_meeting_id = row.zoom_meeting_id;
-    m.zoom_uuid = row.zoom_uuid;
-    m.zoom_topic = row.zoom_topic;
-    m.zoom_host = row.zoom_host;
-    m.zoom_status = row.zoom_status;
-    m.at = row.at;
-    m.timezone = row.timezone;
-    m.meeting_duration_seconds = row.meeting_duration_seconds;
-    m.meeting_ended_at = row.meeting_ended_at;
-    if (!m.assignee || m.assignee === "Unassigned") m.assignee = row.assignee || "Unassigned";
-    if (!prior || prior.summary_source !== "manual") {
-      m.summary_status = row.summary_status;
-      m.summary_source = row.summary_source;
-      m.summary_overview = row.summary_overview;
-      m.summary_text = row.summary_text;
-      m.summary_details = row.summary_details ? JSON.parse(row.summary_details) : [];
-      m.summary_next_steps = row.summary_next_steps ? JSON.parse(row.summary_next_steps) : [];
-      m.summary_created_at = row.summary_created_at;
-    }
-    merged.push(m);
-  }
+  });
   return nonZoom.concat(merged);
 }
 __name(mergeZoomMeetings, "mergeZoomMeetings");
@@ -344,6 +336,18 @@ async function handleDbBlobRequest(e, r, t) {
       return errorResponse("Invalid JSON body", 400);
     }
     if (null === s || "object" != typeof s || Array.isArray(s)) return errorResponse("Body must be a JSON object (the whole db)", 400);
+    // zoom_crm_meetings is the sole authoritative owner of a Zoom meeting's
+    // entire record (see mergeZoomMeetings). A client's snapshot always
+    // reflects whatever GET last merged in, so without this filter a
+    // routine autosave would copy that merged data straight back into
+    // crm_snapshot -- exactly the dual-ownership/stale-copy problem this
+    // architecture exists to prevent. Any meeting the client is trying to
+    // save that carries a zoom_meeting_id is dropped here unconditionally;
+    // legitimate edits to a Zoom meeting go through /api/zoom/meetings/:id
+    // instead, which writes zoom_crm_meetings directly.
+    if (Array.isArray(s.meetings)) {
+      s.meetings = s.meetings.filter(function(m) { return !(m && m.zoom_meeting_id); });
+    }
     const o = JSON.stringify(s);
     if (o.length > 8388608) return errorResponse("Snapshot too large", 413);
     const n = isoNow();
@@ -969,14 +973,34 @@ async function findCrmUserByZoomUserId(env, orgId, zoomUserId) {
 }
 __name(findCrmUserByZoomUserId, "findCrmUserByZoomUserId");
 
+async function loadSnapshotData(env, orgId) {
+  // Real CRM records (contacts, deals, ...) live only in the crm_snapshot
+  // JSON blob -- the normalized D1 tables of the same name are unused by
+  // the frontend and were found empty in production. Anything that needs
+  // to look a contact/deal up (matching, PATCH validation) must read the
+  // blob, not those tables. Read-only: never write back through this path.
+  const row = await env.DB.prepare("SELECT data FROM crm_snapshot WHERE org_id = ?").bind(orgId).first();
+  if (!row || !row.data) return null;
+  try {
+    return JSON.parse(row.data);
+  } catch (e) {
+    console.error("crm_snapshot corrupted while reading for match/validation", e.message);
+    return null;
+  }
+}
+__name(loadSnapshotData, "loadSnapshotData");
+
 async function matchContactByPhone(env, orgId, phoneNumber) {
   if (!phoneNumber) return null;
   const digits = String(phoneNumber).replace(/[^\d]/g, "").slice(-10);
   if (!digits) return null;
-  const row = await env.DB.prepare(
-    "SELECT id FROM contacts WHERE org_id = ? AND deleted_at IS NULL AND phone IS NOT NULL AND replace(replace(replace(replace(phone,'-',''),' ',''),'(',''),')','') LIKE ?"
-  ).bind(orgId, "%" + digits).first();
-  return row ? row.id : null;
+  const data = await loadSnapshotData(env, orgId);
+  const contacts = (data && Array.isArray(data.contacts)) ? data.contacts : [];
+  const match = contacts.find(function(c) {
+    if (!c || c.deleted_at || !c.phone) return false;
+    return String(c.phone).replace(/\D/g, "").slice(-10) === digits;
+  });
+  return match ? match.id : null;
 }
 __name(matchContactByPhone, "matchContactByPhone");
 
@@ -1296,14 +1320,19 @@ async function reconcileMeetingSummary(env, orgId, obj) {
   const detailsJson = details.length ? JSON.stringify(details) : null;
   const stepsJson = steps.length ? JSON.stringify(steps) : null;
   if (existingCrm) {
+    // A user's own manual override (set via PATCH, summary_source='manual')
+    // takes precedence over a real Zoom AI Companion summary arriving after
+    // it -- never silently replace what a person wrote with what Zoom sent.
     await env.DB.prepare(
       `UPDATE zoom_crm_meetings SET
-         summary_status = 'available', summary_source = 'zoom_ai_companion',
-         summary_overview = COALESCE(?, summary_overview),
-         summary_text = COALESCE(?, summary_text),
-         summary_details = COALESCE(?, summary_details),
-         summary_next_steps = COALESCE(?, summary_next_steps),
-         summary_created_at = ?, updated_at = ?
+         summary_status = CASE WHEN summary_source = 'manual' THEN summary_status ELSE 'available' END,
+         summary_source = CASE WHEN summary_source = 'manual' THEN summary_source ELSE 'zoom_ai_companion' END,
+         summary_overview = CASE WHEN summary_source = 'manual' THEN summary_overview ELSE COALESCE(?, summary_overview) END,
+         summary_text = CASE WHEN summary_source = 'manual' THEN summary_text ELSE COALESCE(?, summary_text) END,
+         summary_details = CASE WHEN summary_source = 'manual' THEN summary_details ELSE COALESCE(?, summary_details) END,
+         summary_next_steps = CASE WHEN summary_source = 'manual' THEN summary_next_steps ELSE COALESCE(?, summary_next_steps) END,
+         summary_created_at = CASE WHEN summary_source = 'manual' THEN summary_created_at ELSE ? END,
+         updated_at = ?
        WHERE id = ?`
     ).bind(overview || null, fullText || null, detailsJson, stepsJson, now, now, existingCrm.id).run();
   } else {
@@ -1318,6 +1347,72 @@ async function reconcileMeetingSummary(env, orgId, obj) {
   }
 }
 __name(reconcileMeetingSummary, "reconcileMeetingSummary");
+
+async function handleZoomMeetingPatch(request, env, user, zoomMeetingId) {
+  // The only place a Zoom meeting's user-editable fields (contact/deal
+  // link, internal notes, archive, manual summary override) can be
+  // written. zoom_crm_meetings is the sole owner of the whole record --
+  // crm_snapshot PUT strips zoom-tagged meetings before saving, so this
+  // endpoint (not the giant snapshot PUT) is how the CRM Meetings UI must
+  // persist edits to a Zoom meeting from here on.
+  let body;
+  try {
+    body = await request.json();
+  } catch (e) {
+    return errorResponse("Invalid JSON body", 400);
+  }
+  const row = await env.DB.prepare("SELECT id FROM zoom_crm_meetings WHERE org_id = ? AND zoom_meeting_id = ?").bind(user.orgId, zoomMeetingId).first();
+  if (!row) return errorResponse("Zoom meeting not found", 404);
+
+  const sets = [];
+  const vals = [];
+  if (Object.prototype.hasOwnProperty.call(body, "contactId")) {
+    if (body.contactId) {
+      const data = await loadSnapshotData(env, user.orgId);
+      const contacts = (data && Array.isArray(data.contacts)) ? data.contacts : [];
+      const contact = contacts.find(function(c) { return c && c.id === body.contactId && !c.deleted_at; });
+      if (!contact) return errorResponse("Contact not found", 404);
+      sets.push("matched_contact_id = ?");
+      vals.push(body.contactId);
+      sets.push("match_state = 'matched'");
+    } else {
+      sets.push("matched_contact_id = NULL", "match_state = 'unmatched'");
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(body, "dealId")) {
+    if (body.dealId) {
+      const data = await loadSnapshotData(env, user.orgId);
+      const deals = (data && Array.isArray(data.deals)) ? data.deals : [];
+      const deal = deals.find(function(d) { return d && d.id === body.dealId; });
+      if (!deal) return errorResponse("Deal not found", 404);
+      sets.push("matched_deal_id = ?");
+      vals.push(body.dealId);
+    } else {
+      sets.push("matched_deal_id = NULL");
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(body, "internalNotes")) {
+    sets.push("internal_notes = ?");
+    vals.push(String(body.internalNotes || ""));
+  }
+  if (Object.prototype.hasOwnProperty.call(body, "archived")) {
+    sets.push("archived_at = ?");
+    vals.push(body.archived ? isoNow() : null);
+  }
+  if (Object.prototype.hasOwnProperty.call(body, "manualSummary")) {
+    const text = String(body.manualSummary || "").trim();
+    if (!text) return errorResponse("manualSummary cannot be empty", 400);
+    sets.push("summary_overview = ?", "summary_status = 'available'", "summary_source = 'manual'", "summary_created_at = ?");
+    vals.push(text, isoNow());
+  }
+  if (!sets.length) return errorResponse("No recognized fields to update (contactId, dealId, internalNotes, archived, manualSummary)", 400);
+  sets.push("updated_at = ?");
+  vals.push(isoNow());
+  vals.push(row.id);
+  await env.DB.prepare(`UPDATE zoom_crm_meetings SET ${sets.join(", ")} WHERE id = ?`).bind(...vals).run();
+  return json({ data: { ok: true } });
+}
+__name(handleZoomMeetingPatch, "handleZoomMeetingPatch");
 
 async function handleZoomPhoneUsers(env) {
   // Owner/Admin-only, read-only. Lists real Zoom Phone users (id/email/ext)
@@ -1461,6 +1556,11 @@ var worker_default = { async fetch(e, r, t) {
   }
   if ("/api/zoom/phone-mapping" === s) {
     return withCors(await handleZoomPhoneMapping(e, r, n), e);
+  }
+  if (s.startsWith("/api/zoom/meetings/") && "PATCH" === e.method) {
+    const zoomMeetingId = s.slice("/api/zoom/meetings/".length);
+    if (!zoomMeetingId) return withCors(errorResponse("Not found", 404), e);
+    return withCors(await handleZoomMeetingPatch(e, r, n, zoomMeetingId), e);
   }
   if ("/api/zoom/phone-users" === s && "GET" === e.method) {
     if (!n.isOwner) return withCors(errorResponse("Forbidden: only Owner/Admin can list Zoom Phone users", 403), e);
