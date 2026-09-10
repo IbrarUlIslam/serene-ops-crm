@@ -46,3 +46,12 @@ zone_name = "sereneop.com"
 [[routes]]
 pattern = "crm.sereneop.com/zoom/webhook"
 zone_name = "sereneop.com"
+
+[[routes]]
+# Note: an exact-match pattern here (no trailing wildcard) was observed to NOT
+# reliably take precedence over the Pages custom domain for crm.sereneop.com,
+# even though wrangler reported it as registered and the Cloudflare API showed
+# it in the zone's route list. A wildcard pattern does take precedence
+# correctly. Keep this as a wildcard.
+pattern = "crm.sereneop.com/zoho/*"
+zone_name = "sereneop.com"

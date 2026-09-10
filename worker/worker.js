@@ -1582,11 +1582,400 @@ __name(handleZoomDiagnostics, "handleZoomDiagnostics");
 
 // ===== end Zoom S2S OAuth + Webhook foundation =====
 
+
+// ===== Zoho Mail OAuth + API integration =====
+// Zoho remains source of truth for mail content. D1 keeps only lightweight
+// integration state: OAuth tokens, the Zoho account id, and small
+// cross-reference metadata (contact match, sent-by, sync cursor, claim) --
+// never the mailbox itself.
+var ZOHO_SCOPES = "ZohoMail.messages.ALL,ZohoMail.accounts.READ,ZohoMail.folders.READ";
+
+async function getZohoOAuthRow(env, orgId) {
+  return env.DB.prepare("SELECT * FROM zoho_oauth_tokens WHERE org_id = ?").bind(orgId).first();
+}
+__name(getZohoOAuthRow, "getZohoOAuthRow");
+
+// Zoho Mail's REST API is NOT hosted on the generic api_domain returned by
+// the OAuth token response (that domain -- e.g. www.zohoapis.com -- is for
+// Zoho's general multi-service API gateway used by CRM/Books/etc. and
+// returns 404 for /api/accounts and every other Mail endpoint). Zoho Mail
+// has its own data-center-specific host, mail.zoho.<tld>, derived from the
+// same data center as the accounts server captured at OAuth connect time
+// (accounts.zoho.com -> mail.zoho.com, accounts.zoho.eu -> mail.zoho.eu,
+// etc.). Verified live against the real connected mailbox.
+function zohoMailApiDomain(accountsServer) {
+  try {
+    const host = new URL(accountsServer).host; // e.g. accounts.zoho.com
+    const mailHost = host.replace(/^accounts\./, "mail.");
+    return "https://" + mailHost;
+  } catch (e) {
+    return "https://mail.zoho.com";
+  }
+}
+__name(zohoMailApiDomain, "zohoMailApiDomain");
+
+async function getZohoAccessToken(env, orgId) {
+  const row = await getZohoOAuthRow(env, orgId);
+  if (!row) throw new Error("Zoho is not connected for this organization");
+  const now = Date.now();
+  const expMs = new Date(row.access_token_expires_at).getTime();
+  if (Number.isFinite(expMs) && now < expMs - 6e4) {
+    return { accessToken: row.access_token, apiDomain: row.api_domain, mailApiDomain: zohoMailApiDomain(row.accounts_server), accountId: row.zoho_account_id, accountsServer: row.accounts_server };
+  }
+  // Refresh. Uses the same data-center-specific accounts server captured at
+  // connect time -- never assumed to be .com.
+  if (!env.ZOHO_CLIENT_ID || !env.ZOHO_CLIENT_SECRET) {
+    throw new Error("Zoho OAuth credentials are not configured");
+  }
+  const body = new URLSearchParams({
+    grant_type: "refresh_token",
+    client_id: env.ZOHO_CLIENT_ID,
+    client_secret: env.ZOHO_CLIENT_SECRET,
+    refresh_token: row.refresh_token
+  });
+  const resp = await fetch(`${row.accounts_server}/oauth/v2/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: body.toString()
+  });
+  const json2 = await resp.json().catch(() => null);
+  if (!resp.ok || !json2 || !json2.access_token) {
+    const detail = json2 ? JSON.stringify(json2).slice(0, 300) : `HTTP ${resp.status}`;
+    throw new Error("Zoho token refresh failed: " + detail);
+  }
+  const newExpiresAt = new Date(Date.now() + (Number(json2.expires_in) || 3600) * 1e3).toISOString();
+  const newApiDomain = json2.api_domain || row.api_domain;
+  await env.DB.prepare(
+    "UPDATE zoho_oauth_tokens SET access_token = ?, access_token_expires_at = ?, api_domain = COALESCE(?, api_domain), updated_at = ? WHERE org_id = ?"
+  ).bind(json2.access_token, newExpiresAt, newApiDomain, isoNow(), orgId).run();
+  return { accessToken: json2.access_token, apiDomain: newApiDomain, mailApiDomain: zohoMailApiDomain(row.accounts_server), accountId: row.zoho_account_id, accountsServer: row.accounts_server };
+}
+__name(getZohoAccessToken, "getZohoAccessToken");
+
+async function zohoApiFetch(env, orgId, path, options) {
+  const opts = options || {};
+  const tok = await getZohoAccessToken(env, orgId);
+  const resp = await fetch(`${tok.mailApiDomain}${path}`, {
+    method: opts.method || "GET",
+    headers: Object.assign(
+      { "Authorization": `Zoho-oauthtoken ${tok.accessToken}` },
+      opts.json ? { "Content-Type": "application/json" } : {},
+      opts.headers || {}
+    ),
+    body: opts.json ? JSON.stringify(opts.json) : opts.body
+  });
+  let body = null;
+  const ct = resp.headers.get("content-type") || "";
+  if (ct.includes("application/json")) {
+    body = await resp.json().catch(() => null);
+  }
+  return { ok: resp.ok, status: resp.status, body, raw: ct.includes("application/json") ? null : resp };
+}
+__name(zohoApiFetch, "zohoApiFetch");
+
+async function handleZohoOAuthStart(request, env, user) {
+  if (!user.isOwner) return errorResponse("Forbidden: only Owner/Admin can connect Zoho Mail", 403);
+  if (!env.ZOHO_CLIENT_ID) return errorResponse("Zoho OAuth is not configured", 503);
+  const state = genId("zst").slice(0, 40);
+  await env.DB.prepare(
+    "INSERT INTO zoho_oauth_state (state, org_id, created_by, created_at) VALUES (?, ?, ?, ?)"
+  ).bind(state, user.orgId, user.email || user.id || null, isoNow()).run();
+  const redirectUri = "https://crm.sereneop.com/zoho/oauth/callback";
+  const authUrl = "https://accounts.zoho.com/oauth/v2/auth?" + new URLSearchParams({
+    scope: ZOHO_SCOPES,
+    client_id: env.ZOHO_CLIENT_ID,
+    response_type: "code",
+    access_type: "offline",
+    redirect_uri: redirectUri,
+    state,
+    prompt: "consent"
+  }).toString();
+  return Response.redirect(authUrl, 302);
+}
+__name(handleZohoOAuthStart, "handleZohoOAuthStart");
+
+async function handleZohoOAuthCallback(request, env) {
+  const url = new URL(request.url);
+  const code = url.searchParams.get("code");
+  const state = url.searchParams.get("state");
+  const accountsServerRaw = url.searchParams.get("accounts-server");
+  const errorParam = url.searchParams.get("error");
+  if (errorParam) {
+    return Response.redirect(`https://crm.sereneop.com/?zoho=error&reason=${encodeURIComponent(errorParam)}`, 302);
+  }
+  if (!code || !state) {
+    return Response.redirect("https://crm.sereneop.com/?zoho=error&reason=missing_code_or_state", 302);
+  }
+  const stateRow = await env.DB.prepare("SELECT * FROM zoho_oauth_state WHERE state = ?").bind(state).first();
+  if (!stateRow) {
+    return Response.redirect("https://crm.sereneop.com/?zoho=error&reason=invalid_state", 302);
+  }
+  await env.DB.prepare("DELETE FROM zoho_oauth_state WHERE state = ?").bind(state).run();
+  // Stale state (older than 10 minutes) is rejected rather than honored, in
+  // case a link was reused or replayed long after the real authorization.
+  const stateAgeMs = Date.now() - new Date(stateRow.created_at).getTime();
+  if (!Number.isFinite(stateAgeMs) || stateAgeMs > 10 * 60 * 1e3) {
+    return Response.redirect("https://crm.sereneop.com/?zoho=error&reason=expired_state", 302);
+  }
+
+  // Never assume .com: Zoho's own authorization response tells us which
+  // data-center accounts server actually issued this code.
+  const accountsServer = accountsServerRaw ? accountsServerRaw.replace(/\/$/, "") : "https://accounts.zoho.com";
+  if (!env.ZOHO_CLIENT_ID || !env.ZOHO_CLIENT_SECRET) {
+    return Response.redirect("https://crm.sereneop.com/?zoho=error&reason=not_configured", 302);
+  }
+  const redirectUri = "https://crm.sereneop.com/zoho/oauth/callback";
+  const tokenBody = new URLSearchParams({
+    grant_type: "authorization_code",
+    client_id: env.ZOHO_CLIENT_ID,
+    client_secret: env.ZOHO_CLIENT_SECRET,
+    redirect_uri: redirectUri,
+    code
+  });
+  const tokenResp = await fetch(`${accountsServer}/oauth/v2/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: tokenBody.toString()
+  });
+  const tokenJson = await tokenResp.json().catch(() => null);
+  if (!tokenResp.ok || !tokenJson || !tokenJson.access_token) {
+    console.error("Zoho token exchange failed", tokenJson);
+    return Response.redirect("https://crm.sereneop.com/?zoho=error&reason=token_exchange_failed", 302);
+  }
+  const apiDomain = tokenJson.api_domain || accountsServer;
+  const expiresAt = new Date(Date.now() + (Number(tokenJson.expires_in) || 3600) * 1e3).toISOString();
+
+  // Fetch the connected mailbox's account id + address (needed for every
+  // subsequent Mail API call, and shown to the user as confirmation of
+  // which mailbox got connected).
+  let zohoAccountId = null, zohoEmail = null;
+  try {
+    const acctResp = await fetch(`${zohoMailApiDomain(accountsServer)}/api/accounts`, {
+      headers: { "Authorization": `Zoho-oauthtoken ${tokenJson.access_token}` }
+    });
+    const acctJson = await acctResp.json().catch(() => null);
+    const first = acctJson && Array.isArray(acctJson.data) ? acctJson.data[0] : null;
+    if (first) {
+      zohoAccountId = first.accountId || null;
+      zohoEmail = first.primaryEmailAddress || first.mailboxAddress || null;
+    }
+  } catch (e) {
+    console.error("Zoho account lookup after OAuth failed", e.message);
+  }
+
+  const now = isoNow();
+  await env.DB.prepare(
+    `INSERT INTO zoho_oauth_tokens (org_id, accounts_server, api_domain, zoho_account_id, zoho_email, access_token, refresh_token, access_token_expires_at, scope, connected_by, connected_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(org_id) DO UPDATE SET
+       accounts_server = excluded.accounts_server,
+       api_domain = excluded.api_domain,
+       zoho_account_id = excluded.zoho_account_id,
+       zoho_email = excluded.zoho_email,
+       access_token = excluded.access_token,
+       refresh_token = excluded.refresh_token,
+       access_token_expires_at = excluded.access_token_expires_at,
+       scope = excluded.scope,
+       updated_at = excluded.updated_at`
+  ).bind(
+    stateRow.org_id, accountsServer, apiDomain, zohoAccountId, zohoEmail,
+    tokenJson.access_token, tokenJson.refresh_token || null, expiresAt, tokenJson.scope || ZOHO_SCOPES,
+    stateRow.created_by, now, now
+  ).run();
+
+  return Response.redirect("https://crm.sereneop.com/?zoho=connected", 302);
+}
+__name(handleZohoOAuthCallback, "handleZohoOAuthCallback");
+
+async function handleZohoDisconnect(request, env, user) {
+  if (!user.isOwner) return errorResponse("Forbidden: only Owner/Admin can disconnect Zoho Mail", 403);
+  await env.DB.prepare("DELETE FROM zoho_oauth_tokens WHERE org_id = ?").bind(user.orgId).run();
+  return json({ data: { ok: true } });
+}
+__name(handleZohoDisconnect, "handleZohoDisconnect");
+
+async function handleZohoStatus(request, env, user) {
+  const row = await getZohoOAuthRow(env, user.orgId);
+  if (!row) return json({ data: { connected: false } });
+  return json({ data: {
+    connected: true,
+    email: row.zoho_email,
+    connectedBy: row.connected_by,
+    connectedAt: row.connected_at
+  } });
+}
+__name(handleZohoStatus, "handleZohoStatus");
+
+async function requireZohoAccount(env, orgId) {
+  const row = await getZohoOAuthRow(env, orgId);
+  if (!row || !row.zoho_account_id) throw new Error("Zoho Mail is not connected");
+  return row;
+}
+__name(requireZohoAccount, "requireZohoAccount");
+
+async function handleZohoFolders(request, env, user) {
+  try {
+    const row = await requireZohoAccount(env, user.orgId);
+    const result = await zohoApiFetch(env, user.orgId, `/api/accounts/${row.zoho_account_id}/folders`);
+    if (!result.ok) return errorResponse("Zoho folders request failed: " + JSON.stringify(result.body).slice(0, 300), 502);
+    return json({ data: (result.body && result.body.data) || [] });
+  } catch (e) {
+    return errorResponse(e.message, 409);
+  }
+}
+__name(handleZohoFolders, "handleZohoFolders");
+
+async function handleZohoMessagesList(request, env, user) {
+  const url = new URL(request.url);
+  const folderId = url.searchParams.get("folderId");
+  if (!folderId) return errorResponse("folderId is required", 400);
+  const start = url.searchParams.get("start") || "1";
+  const limit = url.searchParams.get("limit") || "25";
+  try {
+    const row = await requireZohoAccount(env, user.orgId);
+    const qs = new URLSearchParams({ folderId, start, limit, sortBy: "date", sortorder: "false" });
+    const result = await zohoApiFetch(env, user.orgId, `/api/accounts/${row.zoho_account_id}/messages/view?${qs.toString()}`);
+    if (!result.ok) return errorResponse("Zoho messages request failed: " + JSON.stringify(result.body).slice(0, 300), 502);
+    return json({ data: (result.body && result.body.data) || [] });
+  } catch (e) {
+    return errorResponse(e.message, 409);
+  }
+}
+__name(handleZohoMessagesList, "handleZohoMessagesList");
+
+async function handleZohoMessageContent(request, env, user, folderId, messageId) {
+  try {
+    const row = await requireZohoAccount(env, user.orgId);
+    const result = await zohoApiFetch(env, user.orgId, `/api/accounts/${row.zoho_account_id}/folders/${folderId}/messages/${messageId}/content`);
+    if (!result.ok) return errorResponse("Zoho message content request failed: " + JSON.stringify(result.body).slice(0, 300), 502);
+    return json({ data: (result.body && result.body.data) || null });
+  } catch (e) {
+    return errorResponse(e.message, 409);
+  }
+}
+__name(handleZohoMessageContent, "handleZohoMessageContent");
+
+async function handleZohoMarkRead(request, env, user) {
+  let body;
+  try { body = await request.json(); } catch (e) { return errorResponse("Invalid JSON body", 400); }
+  if (!body || !Array.isArray(body.messageIds) || !body.messageIds.length) {
+    return errorResponse("messageIds (array) is required", 400);
+  }
+  try {
+    const row = await requireZohoAccount(env, user.orgId);
+    const result = await zohoApiFetch(env, user.orgId, `/api/accounts/${row.zoho_account_id}/updatemessage`, {
+      method: "PUT",
+      json: { mode: body.read === false ? "markAsUnread" : "markAsRead", messageId: body.messageIds }
+    });
+    if (!result.ok) return errorResponse("Zoho mark-read request failed: " + JSON.stringify(result.body).slice(0, 300), 502);
+    return json({ data: { ok: true } });
+  } catch (e) {
+    return errorResponse(e.message, 409);
+  }
+}
+__name(handleZohoMarkRead, "handleZohoMarkRead");
+
+async function handleZohoSend(request, env, user) {
+  let body;
+  try { body = await request.json(); } catch (e) { return errorResponse("Invalid JSON body", 400); }
+  if (!body || !body.toAddress || !body.subject) return errorResponse("toAddress and subject are required", 400);
+  try {
+    const row = await requireZohoAccount(env, user.orgId);
+    const payload = {
+      fromAddress: row.zoho_email,
+      toAddress: body.toAddress,
+      ccAddress: body.ccAddress || undefined,
+      bccAddress: body.bccAddress || undefined,
+      subject: body.subject,
+      content: body.content || "",
+      askReceipt: "no"
+    };
+    if (Array.isArray(body.attachmentIds) && body.attachmentIds.length) {
+      payload.attachments = body.attachmentIds.map(function(id) { return { storeName: "reserved", attachmentPath: id }; });
+    }
+    const result = await zohoApiFetch(env, user.orgId, `/api/accounts/${row.zoho_account_id}/messages`, { method: "POST", json: payload });
+    if (!result.ok) return errorResponse("Zoho send failed: " + JSON.stringify(result.body).slice(0, 300), 502);
+    return json({ data: (result.body && result.body.data) || { ok: true } });
+  } catch (e) {
+    return errorResponse(e.message, 409);
+  }
+}
+__name(handleZohoSend, "handleZohoSend");
+
+async function handleZohoReplyOrForward(request, env, user, messageId) {
+  let body;
+  try { body = await request.json(); } catch (e) { return errorResponse("Invalid JSON body", 400); }
+  const mode = body && body.mode;
+  if (!["reply", "replyall", "forward"].includes(mode)) {
+    return errorResponse("mode must be one of reply, replyall, forward", 400);
+  }
+  try {
+    const row = await requireZohoAccount(env, user.orgId);
+    const payload = {
+      mode,
+      content: body.content || "",
+      action: mode === "forward" ? "forward" : "reply",
+      toAddress: mode === "forward" ? body.toAddress : undefined
+    };
+    if (mode === "forward" && !body.toAddress) return errorResponse("toAddress is required to forward", 400);
+    const result = await zohoApiFetch(env, user.orgId, `/api/accounts/${row.zoho_account_id}/messages/${messageId}`, { method: "POST", json: payload });
+    if (!result.ok) return errorResponse("Zoho reply/forward failed: " + JSON.stringify(result.body).slice(0, 300), 502);
+    return json({ data: (result.body && result.body.data) || { ok: true } });
+  } catch (e) {
+    return errorResponse(e.message, 409);
+  }
+}
+__name(handleZohoReplyOrForward, "handleZohoReplyOrForward");
+
+async function handleZohoAttachmentDownload(request, env, user, folderId, messageId, attachmentId) {
+  try {
+    const row = await requireZohoAccount(env, user.orgId);
+    const tok = await getZohoAccessToken(env, user.orgId);
+    const resp = await fetch(
+      `${tok.mailApiDomain}/api/accounts/${row.zoho_account_id}/folders/${folderId}/messages/${messageId}/attachments/${attachmentId}`,
+      { headers: { "Authorization": `Zoho-oauthtoken ${tok.accessToken}` } }
+    );
+    if (!resp.ok) return errorResponse("Zoho attachment download failed", 502);
+    return new Response(resp.body, {
+      status: 200,
+      headers: {
+        "Content-Type": resp.headers.get("content-type") || "application/octet-stream",
+        "Content-Disposition": resp.headers.get("content-disposition") || "attachment"
+      }
+    });
+  } catch (e) {
+    return errorResponse(e.message, 409);
+  }
+}
+__name(handleZohoAttachmentDownload, "handleZohoAttachmentDownload");
+
+async function handleZohoAttachmentUpload(request, env, user) {
+  try {
+    const row = await requireZohoAccount(env, user.orgId);
+    const tok = await getZohoAccessToken(env, user.orgId);
+    const incomingCt = request.headers.get("content-type") || "application/octet-stream";
+    const resp = await fetch(`${tok.mailApiDomain}/api/accounts/${row.zoho_account_id}/messages/attachments`, {
+      method: "POST",
+      headers: { "Authorization": `Zoho-oauthtoken ${tok.accessToken}`, "Content-Type": incomingCt },
+      body: request.body
+    });
+    const respJson = await resp.json().catch(() => null);
+    if (!resp.ok) return errorResponse("Zoho attachment upload failed: " + JSON.stringify(respJson).slice(0, 300), 502);
+    return json({ data: (respJson && respJson.data) || null });
+  } catch (e) {
+    return errorResponse(e.message, 409);
+  }
+}
+__name(handleZohoAttachmentUpload, "handleZohoAttachmentUpload");
+
+// ===== end Zoho Mail OAuth + API integration =====
+
 var worker_default = { async fetch(e, r, t) {
   const s = new URL(e.url).pathname;
   if ("OPTIONS" === e.method) return new Response(null, { status: 204, headers: corsHeaders(e) });
   if ("/api/health" === s) return withCors(json({ status: "ok", time: isoNow() }), e);
   if ("/zoom/webhook" === s) return handleZoomWebhook(e, r);
+  if ("/zoho/oauth/callback" === s) return handleZohoOAuthCallback(e, r);
   if (!s.startsWith("/api/")) return errorResponse("Not found", 404);
   const o = await verifyAccessJwt(e, r);
   if (!o.ok) return withCors(errorResponse(o.error, o.status), e);
@@ -1602,6 +1991,48 @@ var worker_default = { async fetch(e, r, t) {
   if ("/api/me" === s) {
     const t2 = await r.DB.prepare("SELECT password_hash FROM users WHERE id = ?").bind(n.id).first();
     return withCors(meResponse(n, t2 && t2.password_hash), e);
+  }
+  if ("/api/zoho/oauth/start" === s && "GET" === e.method) {
+    return await handleZohoOAuthStart(e, r, n);
+  }
+  if ("/api/zoho/disconnect" === s && "POST" === e.method) {
+    return withCors(await handleZohoDisconnect(e, r, n), e);
+  }
+  if ("/api/zoho/status" === s && "GET" === e.method) {
+    return withCors(await handleZohoStatus(e, r, n), e);
+  }
+  if ("/api/zoho/mail/folders" === s && "GET" === e.method) {
+    return withCors(await handleZohoFolders(e, r, n), e);
+  }
+  if ("/api/zoho/mail/messages" === s && "GET" === e.method) {
+    return withCors(await handleZohoMessagesList(e, r, n), e);
+  }
+  if ("/api/zoho/mail/messages/mark-read" === s && "PUT" === e.method) {
+    return withCors(await handleZohoMarkRead(e, r, n), e);
+  }
+  if ("/api/zoho/mail/send" === s && "POST" === e.method) {
+    return withCors(await handleZohoSend(e, r, n), e);
+  }
+  if (s.startsWith("/api/zoho/mail/messages/") && s.endsWith("/action") && "POST" === e.method) {
+    const parts0 = s.split("/");
+    const messageId0 = parts0[5];
+    if (!messageId0) return withCors(errorResponse("Not found", 404), e);
+    return withCors(await handleZohoReplyOrForward(e, r, n, messageId0), e);
+  }
+  if (s.startsWith("/api/zoho/mail/attachments/") && "GET" === e.method) {
+    const parts1 = s.slice("/api/zoho/mail/attachments/".length).split("/");
+    const [folderId1, messageId1, attachmentId1] = parts1;
+    if (!folderId1 || !messageId1 || !attachmentId1) return withCors(errorResponse("Not found", 404), e);
+    return await handleZohoAttachmentDownload(e, r, n, folderId1, messageId1, attachmentId1);
+  }
+  if ("/api/zoho/mail/attachments/upload" === s && "POST" === e.method) {
+    return withCors(await handleZohoAttachmentUpload(e, r, n), e);
+  }
+  if (s.startsWith("/api/zoho/mail/messages/") && "GET" === e.method) {
+    const parts2 = s.slice("/api/zoho/mail/messages/".length).split("/");
+    const [folderId2, messageId2] = parts2;
+    if (!folderId2 || !messageId2) return withCors(errorResponse("Not found", 404), e);
+    return withCors(await handleZohoMessageContent(e, r, n, folderId2, messageId2), e);
   }
   if ("/api/zoom/diagnostics" === s && "GET" === e.method) {
     return withCors(await handleZoomDiagnostics(r), e);
@@ -1641,6 +2072,47 @@ var worker_default = { async fetch(e, r, t) {
   if ("/api/zoom/diagnostics/backfill-meeting-sync" === s && "POST" === e.method) {
     if (!n.isOwner) return withCors(errorResponse("Forbidden: only Owner/Admin can run this", 403), e);
     return withCors(json(await backfillMeetingSyncFromLedger(r, n.orgId)), e);
+  }
+  // Owner-only diagnostic: fetches the raw Zoho /api/accounts response using
+  // the org's currently stored Zoho token, with no parsing applied. Used to
+  // see Zoho's real field names/shape when zoho_account_id/zoho_email end up
+  // null after OAuth. Never writes anything.
+  if ("/api/zoho/diagnostics/accounts-raw" === s && "GET" === e.method) {
+    if (!n.isOwner) return withCors(errorResponse("Forbidden: only Owner/Admin can run this", 403), e);
+    try {
+      const tok = await getZohoAccessToken(r, n.orgId);
+      const hostOverride = new URL(e.url).searchParams.get("host");
+      const baseHost = hostOverride || tok.mailApiDomain;
+      const resp = await fetch(`${baseHost}/api/accounts`, { headers: { "Authorization": `Zoho-oauthtoken ${tok.accessToken}` } });
+      const bodyText = await resp.text();
+      return withCors(json({ status: resp.status, baseHost, body: bodyText.slice(0, 4000) }), e);
+    } catch (err) {
+      return withCors(errorResponse("Zoho accounts lookup failed: " + err.message, 502), e);
+    }
+  }
+  // Owner-only repair tool: re-fetches the Zoho account id/email using the
+  // org's already-stored, already-real OAuth token and updates
+  // zoho_oauth_tokens. Safe to keep -- idempotent, never invents data, only
+  // corrects a parsing bug from the initial OAuth callback. No new consent
+  // needed since it reuses the existing refresh token.
+  if ("/api/zoho/diagnostics/backfill-account-info" === s && "POST" === e.method) {
+    if (!n.isOwner) return withCors(errorResponse("Forbidden: only Owner/Admin can run this", 403), e);
+    try {
+      const tok = await getZohoAccessToken(r, n.orgId);
+      const resp = await fetch(`${tok.mailApiDomain}/api/accounts`, { headers: { "Authorization": `Zoho-oauthtoken ${tok.accessToken}` } });
+      const acctJson = await resp.json().catch(() => null);
+      const list = acctJson && (Array.isArray(acctJson.data) ? acctJson.data : (Array.isArray(acctJson) ? acctJson : null));
+      const first = list && list[0];
+      if (!first) return withCors(errorResponse("Zoho accounts response had no usable account entry: " + JSON.stringify(acctJson).slice(0, 300), 502), e);
+      const accountId = first.accountId || first.account_id || null;
+      const email = first.primaryEmailAddress || first.mailboxAddress || first.mailBoxAddress || first.emailAddress || first.email || null;
+      if (!accountId) return withCors(errorResponse("Could not find accountId in Zoho response: " + JSON.stringify(first).slice(0, 300), 502), e);
+      await r.DB.prepare("UPDATE zoho_oauth_tokens SET zoho_account_id = ?, zoho_email = ?, updated_at = ? WHERE org_id = ?")
+        .bind(accountId, email, isoNow(), n.orgId).run();
+      return withCors(json({ data: { accountId, email } }), e);
+    } catch (err) {
+      return withCors(errorResponse("Zoho account backfill failed: " + err.message, 502), e);
+    }
   }
   if (RESOURCES[i]) {
     return withCors(await handleResourceRequest(e, r, n, i, d), e);
