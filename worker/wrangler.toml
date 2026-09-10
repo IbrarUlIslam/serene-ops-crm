@@ -55,3 +55,37 @@ zone_name = "sereneop.com"
 # correctly. Keep this as a wildcard.
 pattern = "crm.sereneop.com/zoho/*"
 zone_name = "sereneop.com"
+
+[[routes]]
+# staging-crm.sereneop.com: a dedicated same-origin staging hostname, added so
+# authenticated live regression of the zoom-zoho-integration Pages branch
+# does not hit the cross-site Cloudflare Access + CORS problem that a
+# *.pages.dev preview origin has when calling crm.sereneop.com/api/*. This
+# hostname has NO separate Pages custom domain -- every request on it (both
+# /api/* and the plain frontend) is handled entirely by this Worker: /api/*
+# goes through the exact same handlers as production, and everything else is
+# proxied server-side to the current zoom-zoho-integration Pages branch
+# deployment (see proxyStagingFrontend in worker.js). Must be paired with a
+# Cloudflare Access application protecting staging-crm.sereneop.com (mirroring
+# the crm.sereneop.com app's policy) before this hostname is used -- see the
+# "Staging hostname" section below.
+pattern = "staging-crm.sereneop.com/*"
+zone_name = "sereneop.com"
+
+# ---------------------------------------------------------------------------
+# Staging hostname: Cloudflare Access application (STATUS: pending, 2026-09-10)
+# ---------------------------------------------------------------------------
+# staging-crm.sereneop.com MUST be protected by a Cloudflare Zero Trust Access
+# application before real use, mirroring the existing crm.sereneop.com app's
+# policy (same authorized CRM user group -- no Everyone/bypass rule). Access
+# applications are not managed by wrangler/this file, and the account's
+# current wrangler OAuth token has no Zero Trust Access scope (confirmed via
+# a live API check: GET .../access/organizations and .../access/groups both
+# returned 403 Authentication error). Until a separately scoped Cloudflare
+# API token with Access (Apps and Policies) read+edit is available, this
+# hostname is NOT Access-protected -- the Worker itself still requires a
+# valid Cf-Access-Jwt-Assertion header for every /api/* call (see
+# verifyAccessJwt in worker.js), so unauthenticated requests are rejected,
+# but nobody can actually obtain that header on this hostname yet because
+# Access is not intercepting it. Do not treat the route above as "live" for
+# real use until the Access application exists.

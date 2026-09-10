@@ -2273,12 +2273,47 @@ __name(handleZohoAttachmentUpload, "handleZohoAttachmentUpload");
 
 // ===== end Zoho Mail OAuth + API integration =====
 
+// ===== Staging same-origin frontend proxy (added for staging-crm.sereneop.com) =====
+// Serves the current zoom-zoho-integration Pages branch deployment for any
+// non-API request on staging-crm.sereneop.com, so the staging frontend and
+// this same Worker's real /api/* handlers share one origin. Never used for
+// crm.sereneop.com (production keeps coming from the Pages custom domain
+// untouched) and never touches /api/*, /zoom/webhook or /zoho/oauth/callback,
+// which are already routed above this call.
+var STAGING_FRONTEND_ORIGIN = "https://zoom-zoho-integration.serene-ops-crm.pages.dev";
+async function proxyStagingFrontend(request, url) {
+  const target = STAGING_FRONTEND_ORIGIN + url.pathname + url.search;
+  try {
+    const upstreamResp = await fetch(target, {
+      method: request.method,
+      headers: request.headers,
+      body: ["GET", "HEAD"].includes(request.method) ? void 0 : request.body,
+      redirect: "manual"
+    });
+    return upstreamResp;
+  } catch (err) {
+    return errorResponse("Staging frontend proxy failed: " + err.message, 502);
+  }
+}
+__name(proxyStagingFrontend, "proxyStagingFrontend");
+// ===== end staging same-origin frontend proxy =====
+
 var worker_default = { async fetch(e, r, t) {
-  const s = new URL(e.url).pathname;
+  const _stagingUrl = new URL(e.url);
+  const s = _stagingUrl.pathname;
   if ("OPTIONS" === e.method) return new Response(null, { status: 204, headers: corsHeaders(e) });
   if ("/api/health" === s) return withCors(json({ status: "ok", time: isoNow() }), e);
   if ("/zoom/webhook" === s) return handleZoomWebhook(e, r);
   if ("/zoho/oauth/callback" === s) return handleZohoOAuthCallback(e, r);
+  // Same-origin staging hostname: everything that is NOT an /api/* call (and
+  // not the two public exceptions above) is served by proxying the current
+  // zoom-zoho-integration Pages branch deployment server-side, so the
+  // staging frontend and its API share one origin (crm.sereneop.com's
+  // production frontend is untouched -- it still comes from the Pages
+  // custom domain, not this Worker).
+  if (_stagingUrl.hostname === "staging-crm.sereneop.com" && !s.startsWith("/api/")) {
+    return proxyStagingFrontend(e, _stagingUrl);
+  }
   if (!s.startsWith("/api/")) return errorResponse("Not found", 404);
   const o = await verifyAccessJwt(e, r);
   if (!o.ok) return withCors(errorResponse(o.error, o.status), e);
