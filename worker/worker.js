@@ -1975,20 +1975,36 @@ async function handleZohoReplyOrForward(request, env, user, messageId) {
   if (!["reply", "replyall", "forward"].includes(mode)) {
     return errorResponse("mode must be one of reply, replyall, forward", 400);
   }
+  if (!body.toAddress) return errorResponse("toAddress is required", 400);
   try {
     const row = await requireZohoAccount(env, user.orgId);
+    // Zoho's Mail API only reliably supports "action":"reply" on this
+    // endpoint (POST /api/accounts/{id}/messages/{messageId}). Verified
+    // live on 2026-09-10: a lowercase "forward" action crashes Zoho's
+    // backend with a 500 Internal Error; a capitalized "Forward" is
+    // rejected by their validator with PATTERN_NOT_MATCHED
+    // ("zoho-inputstream ..."), regardless of payload shape (tried
+    // fromAddress, subject, toAddress as string/array, form-encoded body).
+    // "action":"reply" (lowercase) works reliably for any toAddress,
+    // including addresses outside the original thread -- so Forward is
+    // implemented on top of that same working call. This sends correctly
+    // but does not carry Zoho's native forward-thread marker the way a
+    // true forward would.
     const payload = {
-      mode,
+      fromAddress: row.zoho_email,
+      toAddress: body.toAddress,
+      ccAddress: body.ccAddress || undefined,
+      bccAddress: body.bccAddress || undefined,
+      subject: body.subject || (mode === "forward" ? "Fwd: (no subject)" : "Re: (no subject)"),
       content: body.content || "",
-      action: mode === "forward" ? "forward" : "reply",
-      toAddress: mode === "forward" ? body.toAddress : undefined
+      askReceipt: "no",
+      action: "reply"
     };
-    if (mode === "forward" && !body.toAddress) return errorResponse("toAddress is required to forward", 400);
     if (Array.isArray(body.attachmentIds) && body.attachmentIds.length) {
       payload.attachments = body.attachmentIds.map(function(id) { return { storeName: "reserved", attachmentPath: id }; });
     }
     const result = await zohoApiFetch(env, user.orgId, `/api/accounts/${row.zoho_account_id}/messages/${messageId}`, { method: "POST", json: payload });
-    if (!result.ok) { console.log("ZOHO_FWD_ERR", result.status, JSON.stringify(result.body)); return errorResponse("Zoho reply/forward failed: " + JSON.stringify(result.body).slice(0, 300), 502); }
+    if (!result.ok) return errorResponse("Zoho reply/forward failed: " + JSON.stringify(result.body).slice(0, 300), 502);
     const rfData = (result.body && result.body.data) || { ok: true };
     await recordZohoSendAttribution(env, user.orgId, user.email || user.id || null, body.contactId || null, null, rfData);
     return json({ data: rfData });
