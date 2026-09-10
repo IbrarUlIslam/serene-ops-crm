@@ -42,3 +42,7 @@ crons = ["*/15 * * * *", "0 20 * * *"]
 [[routes]]
 pattern = "crm.sereneop.com/api/*"
 zone_name = "sereneop.com"
+
+[[routes]]
+pattern = "crm.sereneop.com/zoom/webhook"
+zone_name = "sereneop.com"
