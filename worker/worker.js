@@ -848,6 +848,42 @@ async function zoomApiGet(env, path) {
   return { ok: resp.ok, status: resp.status, body };
 }
 __name(zoomApiGet, "zoomApiGet");
+// Zoom's meeting.started / meeting.ended / meeting.summary_completed webhook
+// payloads do not always carry payload.object.uuid -- observed live against
+// a real test meeting on 2026-09-10, whose webhook events came back with no
+// uuid at all. The numeric meeting id alone is reused across every future
+// occurrence of a recurring (or reusable Personal Meeting ID) meeting, so it
+// is not safe to treat as an occurrence-unique identifier. Rather than
+// fabricate a uuid, this makes one best-effort attempt to recover the real
+// per-occurrence uuid from Zoom's own REST API (GET /past_meetings/{meetingId}/instances,
+// keyed only on the numeric meeting id -- the strongest identifier the
+// webhook reliably gives us) before falling back to the documented
+// meeting_id+uuid-IS-NULL composite match in reconcileMeetingLifecycle /
+// reconcileMeetingSummary. If Zoom's API call fails or returns nothing, this
+// returns null and the existing fallback strategy applies unchanged.
+async function enrichZoomOccurrenceUuid(env, zoomMeetingId, referenceTimeIso) {
+  if (!zoomMeetingId) return null;
+  try {
+    const resp = await zoomApiGet(env, `/past_meetings/${zoomMeetingId}/instances`);
+    if (!resp.ok || !resp.body) return null;
+    const instances = resp.body.meetings || resp.body.instances || [];
+    if (!instances.length) return null;
+    const refMs = referenceTimeIso ? new Date(referenceTimeIso).getTime() : Date.now();
+    if (!Number.isFinite(refMs)) return instances[0].uuid || null;
+    let best = null, bestDiff = Infinity;
+    for (const inst of instances) {
+      const t = new Date(inst.start_time).getTime();
+      if (!Number.isFinite(t)) continue;
+      const diff = Math.abs(t - refMs);
+      if (diff < bestDiff) { bestDiff = diff; best = inst; }
+    }
+    return (best && best.uuid) || instances[0].uuid || null;
+  } catch (e) {
+    console.error("enrichZoomOccurrenceUuid failed", e && e.message);
+    return null;
+  }
+}
+__name(enrichZoomOccurrenceUuid, "enrichZoomOccurrenceUuid");
 
 async function hmacSha256Hex(secret, message) {
   const enc = new TextEncoder();
@@ -918,10 +954,20 @@ async function handleZoomWebhook(request, env) {
   // identical payloads on retry, so a duplicate insert here means "already seen".
   const payloadHash = await sha256Hex(rawBody);
   const eventType = typeof payload.event === "string" ? payload.event : "unknown";
+  // Diagnostic-only: store just the payload.payload.object (never the full
+  // raw body, which could carry account-level fields) so a future real
+  // test can be inspected after the fact -- this event stream previously
+  // kept nothing but a hash, so whether Zoom actually sent a uuid for a
+  // given occurrence could never be checked retroactively.
+  let objectJson = null;
+  try {
+    const obj0 = payload && payload.payload && payload.payload.object;
+    if (obj0) objectJson = JSON.stringify(obj0).slice(0, 8000);
+  } catch (_) {}
   try {
     const result = await env.DB.prepare(
-      "INSERT OR IGNORE INTO zoom_webhook_events (id, event_type, payload_hash, processed) VALUES (?, ?, ?, 0)"
-    ).bind(genId("zwe"), eventType, payloadHash).run();
+      "INSERT OR IGNORE INTO zoom_webhook_events (id, event_type, payload_hash, object_json, processed) VALUES (?, ?, ?, ?, 0)"
+    ).bind(genId("zwe"), eventType, payloadHash, objectJson).run();
     const alreadySeen = !(result.meta && result.meta.changes);
     if (alreadySeen) {
       return json({ received: true, duplicate: true }, 200);
@@ -1213,9 +1259,12 @@ async function backfillMeetingSyncFromLedger(env, orgId) {
 __name(backfillMeetingSyncFromLedger, "backfillMeetingSyncFromLedger");
 
 async function reconcileMeetingLifecycle(env, orgId, eventType, obj) {
-  const zoomUuid = obj.uuid || obj.meeting_uuid || null;
+  let zoomUuid = obj.uuid || obj.meeting_uuid || null;
   const zoomMeetingId = String(obj.id || zoomUuid || "");
   if (!zoomMeetingId) return;
+  if (!zoomUuid) {
+    zoomUuid = await enrichZoomOccurrenceUuid(env, zoomMeetingId, obj.start_time || null);
+  }
   const hostZoomUserId = obj.host_id || null;
   const hostMap = hostZoomUserId ? await findCrmUserByZoomUserId(env, orgId, hostZoomUserId) : null;
   const hostDisplayName = await resolveHostDisplayName(env, orgId, hostMap, obj);
@@ -1289,9 +1338,12 @@ async function reconcileMeetingLifecycle(env, orgId, eventType, obj) {
 __name(reconcileMeetingLifecycle, "reconcileMeetingLifecycle");
 
 async function reconcileMeetingSummary(env, orgId, obj) {
-  const zoomUuid = obj.meeting_uuid || obj.uuid || null;
+  let zoomUuid = obj.meeting_uuid || obj.uuid || null;
   const zoomMeetingId = String(obj.meeting_id || obj.id || zoomUuid || "");
   if (!zoomMeetingId) return;
+  if (!zoomUuid) {
+    zoomUuid = await enrichZoomOccurrenceUuid(env, zoomMeetingId, obj.meeting_start_time || obj.start_time || null);
+  }
   const overview = obj.summary_overview || obj.summary_title || null;
   const normalizeItems = function(arr) {
     return (Array.isArray(arr) ? arr : []).map(function(x) {
@@ -1565,6 +1617,21 @@ var worker_default = { async fetch(e, r, t) {
   if ("/api/zoom/phone-users" === s && "GET" === e.method) {
     if (!n.isOwner) return withCors(errorResponse("Forbidden: only Owner/Admin can list Zoom Phone users", 403), e);
     return withCors(json(await handleZoomPhoneUsers(r)), e);
+  }
+  // Owner-only read-only diagnostic: calls Zoom's own
+  // GET /past_meetings/{meetingId}/instances directly and returns the raw
+  // result, so a real occurrence-uuid question can be checked against
+  // Zoom's API on demand instead of guessing. Never writes anything.
+  if (s.startsWith("/api/zoom/diagnostics/meeting-instances/") && "GET" === e.method) {
+    if (!n.isOwner) return withCors(errorResponse("Forbidden: only Owner/Admin can run this", 403), e);
+    const meetingId = s.slice("/api/zoom/diagnostics/meeting-instances/".length);
+    if (!meetingId) return withCors(errorResponse("Not found", 404), e);
+    try {
+      const result = await zoomApiGet(r, `/past_meetings/${meetingId}/instances`);
+      return withCors(json({ data: result }), e);
+    } catch (err) {
+      return withCors(errorResponse("Zoom API call failed: " + err.message, 502), e);
+    }
   }
   // Standing owner-only repair tool: replays already-real, already-stored
   // zoom_meetings ledger rows into zoom_crm_meetings (the table merged into
