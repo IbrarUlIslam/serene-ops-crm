@@ -1912,7 +1912,24 @@ async function handleZohoMessageContent(request, env, user, folderId, messageId)
     const row = await requireZohoAccount(env, user.orgId);
     const result = await zohoApiFetch(env, user.orgId, `/api/accounts/${row.zoho_account_id}/folders/${folderId}/messages/${messageId}/content`);
     if (!result.ok) return errorResponse("Zoho message content request failed: " + JSON.stringify(result.body).slice(0, 300), 502);
-    return json({ data: (result.body && result.body.data) || null });
+    const data = (result.body && result.body.data) || {};
+    // Zoho's "content" endpoint only returns {messageId, content} -- it does
+    // NOT include attachment info, even when hasAttachment is "1" on the
+    // message (verified live on 2026-09-10). Attachment metadata lives on
+    // the separate "attachmentinfo" endpoint; merged in here so the
+    // frontend's existing `content.attachments` usage (message detail view,
+    // download links) works without needing its own second fetch.
+    try {
+      const attResult = await zohoApiFetch(env, user.orgId, `/api/accounts/${row.zoho_account_id}/folders/${folderId}/messages/${messageId}/attachmentinfo`);
+      const attList = attResult.ok && attResult.body && attResult.body.data && attResult.body.data.attachments;
+      if (Array.isArray(attList)) {
+        data.attachments = attList;
+      }
+    } catch (attErr) {
+      // Best-effort: a missing/failed attachment listing should never break
+      // rendering the message body itself.
+    }
+    return json({ data });
   } catch (e) {
     return errorResponse(e.message, 409);
   }
@@ -1954,8 +1971,10 @@ async function handleZohoSend(request, env, user) {
       content: body.content || "",
       askReceipt: "no"
     };
-    if (Array.isArray(body.attachmentIds) && body.attachmentIds.length) {
-      payload.attachments = body.attachmentIds.map(function(id) { return { storeName: "reserved", attachmentPath: id }; });
+    if (Array.isArray(body.attachments) && body.attachments.length) {
+      payload.attachments = body.attachments
+        .filter(function(a) { return a && a.attachmentPath && a.storeName; })
+        .map(function(a) { return { storeName: a.storeName, attachmentPath: a.attachmentPath, attachmentName: a.attachmentName || "attachment" }; });
     }
     const result = await zohoApiFetch(env, user.orgId, `/api/accounts/${row.zoho_account_id}/messages`, { method: "POST", json: payload });
     if (!result.ok) return errorResponse("Zoho send failed: " + JSON.stringify(result.body).slice(0, 300), 502);
@@ -2000,8 +2019,10 @@ async function handleZohoReplyOrForward(request, env, user, messageId) {
       askReceipt: "no",
       action: "reply"
     };
-    if (Array.isArray(body.attachmentIds) && body.attachmentIds.length) {
-      payload.attachments = body.attachmentIds.map(function(id) { return { storeName: "reserved", attachmentPath: id }; });
+    if (Array.isArray(body.attachments) && body.attachments.length) {
+      payload.attachments = body.attachments
+        .filter(function(a) { return a && a.attachmentPath && a.storeName; })
+        .map(function(a) { return { storeName: a.storeName, attachmentPath: a.attachmentPath, attachmentName: a.attachmentName || "attachment" }; });
     }
     const result = await zohoApiFetch(env, user.orgId, `/api/accounts/${row.zoho_account_id}/messages/${messageId}`, { method: "POST", json: payload });
     if (!result.ok) return errorResponse("Zoho reply/forward failed: " + JSON.stringify(result.body).slice(0, 300), 502);
@@ -2040,13 +2061,19 @@ async function handleZohoAttachmentUpload(request, env, user) {
   try {
     const row = await requireZohoAccount(env, user.orgId);
     const tok = await getZohoAccessToken(env, user.orgId);
-    const incomingCt = request.headers.get("content-type") || "application/octet-stream";
     const reqUrl = new URL(request.url);
     const fileName = reqUrl.searchParams.get("fileName") || "attachment";
     const attachQs = new URLSearchParams({ fileName, isInline: "false" });
+    // Zoho's attachment-upload endpoint rejects any Content-Type other than
+    // application/octet-stream with a 415 UNSUPPORTED_MEDIA_TYPE -- verified
+    // live on 2026-09-10 (a plain text/plain upload was rejected; the same
+    // bytes with Content-Type: application/octet-stream succeeded). It
+    // determines the file type from the fileName extension, not the
+    // Content-Type header, so the browser's real per-file MIME type is
+    // deliberately never forwarded here.
     const resp = await fetch(`${tok.mailApiDomain}/api/accounts/${row.zoho_account_id}/messages/attachments?${attachQs.toString()}`, {
       method: "POST",
-      headers: { "Authorization": `Zoho-oauthtoken ${tok.accessToken}`, "Content-Type": incomingCt },
+      headers: { "Authorization": `Zoho-oauthtoken ${tok.accessToken}`, "Content-Type": "application/octet-stream" },
       body: request.body
     });
     const respJson = await resp.json().catch(() => null);
