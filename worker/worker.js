@@ -861,9 +861,18 @@ async function handleZoomWebhook(request, env) {
     return errorResponse("Internal error", 500);
   }
 
-  // Foundation phase only: the event is durably recorded and de-duplicated.
-  // No downstream CRM records (calls/meetings/voicemails/reminders/Activity)
-  // are created yet -- that wiring is a later, separate phase per plan.
+  // The event is durably recorded and de-duplicated above. Reconciliation
+  // into zoom_calls/zoom_voicemails/zoom_meetings happens here, keyed on
+  // Zoom's own ids so a retried delivery updates the same row instead of
+  // creating a duplicate CRM record.
+  try {
+    await reconcileZoomEvent(env, eventType, payload && payload.payload && payload.payload.object);
+  } catch (e) {
+    console.error("zoom webhook reconciliation failed", eventType, e.message);
+    // Do not fail the webhook response over reconciliation errors -- the
+    // event is already durably recorded for later inspection/replay.
+  }
+
   try {
     await env.DB.prepare("UPDATE zoom_webhook_events SET processed = 1 WHERE payload_hash = ?").bind(payloadHash).run();
   } catch (e) {
@@ -873,6 +882,199 @@ async function handleZoomWebhook(request, env) {
   return json({ received: true }, 200);
 }
 __name(handleZoomWebhook, "handleZoomWebhook");
+
+// ----- Zoom Phone user mapping (authenticated CRM user -> licensed Zoom Phone user) -----
+// Generic by design: never hardcodes a specific person. A CRM user with no
+// active row here has no Zoom Phone identity yet, and the Dialer must show
+// that plainly rather than pretending to place a call.
+
+async function findMappedZoomUser(env, orgId, crmUserId) {
+  return env.DB.prepare(
+    "SELECT crm_user_id, zoom_user_id, zoom_extension, zoom_email FROM zoom_phone_user_map WHERE org_id = ? AND crm_user_id = ? AND active = 1"
+  ).bind(orgId, crmUserId).first();
+}
+__name(findMappedZoomUser, "findMappedZoomUser");
+
+async function findCrmUserByZoomUserId(env, orgId, zoomUserId) {
+  if (!zoomUserId) return null;
+  return env.DB.prepare(
+    "SELECT crm_user_id, zoom_user_id FROM zoom_phone_user_map WHERE org_id = ? AND zoom_user_id = ? AND active = 1"
+  ).bind(orgId, zoomUserId).first();
+}
+__name(findCrmUserByZoomUserId, "findCrmUserByZoomUserId");
+
+async function matchContactByPhone(env, orgId, phoneNumber) {
+  if (!phoneNumber) return null;
+  const digits = String(phoneNumber).replace(/[^\d]/g, "").slice(-10);
+  if (!digits) return null;
+  const row = await env.DB.prepare(
+    "SELECT id FROM contacts WHERE org_id = ? AND deleted_at IS NULL AND phone IS NOT NULL AND replace(replace(replace(replace(phone,'-',''),' ',''),'(',''),')','') LIKE ?"
+  ).bind(orgId, "%" + digits).first();
+  return row ? row.id : null;
+}
+__name(matchContactByPhone, "matchContactByPhone");
+
+async function reconcileZoomEvent(env, eventType, obj) {
+  if (!obj) return;
+  const orgId = "org1";
+  if (eventType === "phone.caller_ended" || eventType === "phone.callee_ended") {
+    await reconcilePhoneCallEnded(env, orgId, eventType, obj);
+    return;
+  }
+  if (eventType === "phone.voicemail_received") {
+    await reconcileVoicemailReceived(env, orgId, obj);
+    return;
+  }
+  if (eventType === "meeting.started" || eventType === "meeting.ended") {
+    await reconcileMeetingLifecycle(env, orgId, eventType, obj);
+    return;
+  }
+  if (eventType === "meeting.summary_completed") {
+    await reconcileMeetingSummary(env, orgId, obj);
+    return;
+  }
+  // Unhandled but recognized-as-received event type: nothing to reconcile.
+}
+__name(reconcileZoomEvent, "reconcileZoomEvent");
+
+async function reconcilePhoneCallEnded(env, orgId, eventType, obj) {
+  const callId = obj.call_id;
+  if (!callId) return;
+  const caller = obj.caller || {};
+  const callee = obj.callee || {};
+  const direction = obj.direction || null;
+  const durationSeconds = typeof obj.duration === "number" ? obj.duration : null;
+
+  // Attribution: whichever side of the call is a Zoom user we have mapped to
+  // a CRM user is the "initiated_by" / handled-by identity. If neither side
+  // maps to a CRM user, the call is Unassigned / Needs Attention -- never
+  // guessed. We check the caller first for outbound, callee first for
+  // inbound, but fall back to whichever side actually resolves.
+  const byCaller = caller.user_id ? await findCrmUserByZoomUserId(env, orgId, caller.user_id) : null;
+  const byCallee = callee.user_id ? await findCrmUserByZoomUserId(env, orgId, callee.user_id) : null;
+  const owner = byCaller || byCallee;
+  const initiatedBy = owner ? owner.crm_user_id : null;
+  const attribution = owner ? "assigned" : "unassigned";
+
+  const externalNumber = direction === "outbound" ? (callee.phone_number || null) : (caller.phone_number || null);
+  const contactId = await matchContactByPhone(env, orgId, externalNumber);
+
+  const existing = await env.DB.prepare("SELECT id FROM zoom_calls WHERE zoom_call_id = ?").bind(callId).first();
+  const now = isoNow();
+  if (existing) {
+    // The paired event (caller_ended / callee_ended) for the same call_id can
+    // arrive twice from Zoom's two perspectives -- update in place, never
+    // insert a second row for the same zoom_call_id (unique index enforces
+    // this too, as a backstop).
+    await env.DB.prepare(
+      `UPDATE zoom_calls SET direction = COALESCE(?, direction), from_number = COALESCE(?, from_number),
+        to_number = COALESCE(?, to_number), status = 'ended', duration_seconds = COALESCE(?, duration_seconds),
+        initiated_by = COALESCE(initiated_by, ?), attribution = CASE WHEN initiated_by IS NULL AND ? IS NOT NULL THEN 'assigned' ELSE attribution END,
+        contact_id = COALESCE(contact_id, ?), match_status = CASE WHEN contact_id IS NULL AND ? IS NOT NULL THEN 'matched' ELSE match_status END,
+        updated_at = ? WHERE id = ?`
+    ).bind(direction, caller.phone_number || null, callee.phone_number || null, durationSeconds, initiatedBy, initiatedBy, contactId, contactId, now, existing.id).run();
+    return;
+  }
+  await env.DB.prepare(
+    `INSERT INTO zoom_calls (id, org_id, call_id, zoom_call_id, zoom_event_id, direction, from_number, to_number, status, duration_seconds, initiated_by, attribution, contact_id, match_status, created_at, updated_at)
+     VALUES (?, ?, NULL, ?, ?, ?, ?, ?, 'ended', ?, ?, ?, ?, ?, ?, ?)`
+  ).bind(genId("zc"), orgId, callId, eventType, direction, caller.phone_number || null, callee.phone_number || null, durationSeconds, initiatedBy, attribution, contactId, contactId ? "matched" : "unmatched", now, now).run();
+}
+__name(reconcilePhoneCallEnded, "reconcilePhoneCallEnded");
+
+async function reconcileVoicemailReceived(env, orgId, obj) {
+  const vmId = obj.id;
+  if (!vmId) return;
+  const existing = await env.DB.prepare("SELECT id FROM zoom_voicemails WHERE id = ?").bind("zvm_" + vmId).first();
+  if (existing) return;
+  const contactId = await matchContactByPhone(env, orgId, obj.caller_number);
+  const zoomCall = obj.call_id ? await env.DB.prepare("SELECT id FROM zoom_calls WHERE zoom_call_id = ?").bind(obj.call_id).first() : null;
+  await env.DB.prepare(
+    `INSERT OR IGNORE INTO zoom_voicemails (id, org_id, zoom_call_row_id, contact_id, from_number, duration_seconds, recording_url, transcript, status, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 'unread', ?)`
+  ).bind("zvm_" + vmId, orgId, zoomCall ? zoomCall.id : null, contactId, obj.caller_number || null, typeof obj.duration === "number" ? obj.duration : null, obj.download_url || null, isoNow()).run();
+}
+__name(reconcileVoicemailReceived, "reconcileVoicemailReceived");
+
+async function reconcileMeetingLifecycle(env, orgId, eventType, obj) {
+  const zoomMeetingId = String(obj.id || obj.uuid || "");
+  if (!zoomMeetingId) return;
+  const hostZoomUserId = obj.host_id || null;
+  const hostMap = hostZoomUserId ? await findCrmUserByZoomUserId(env, orgId, hostZoomUserId) : null;
+  const existing = await env.DB.prepare("SELECT id FROM zoom_meetings WHERE zoom_meeting_id = ?").bind(zoomMeetingId).first();
+  const now = isoNow();
+  if (existing) {
+    await env.DB.prepare(
+      "UPDATE zoom_meetings SET topic = COALESCE(?, topic), start_time = COALESCE(?, start_time), duration_minutes = COALESCE(?, duration_minutes), host_user_id = COALESCE(host_user_id, ?), updated_at = ? WHERE id = ?"
+    ).bind(obj.topic || null, obj.start_time || null, typeof obj.duration === "number" ? obj.duration : null, hostMap ? hostMap.crm_user_id : null, now, existing.id).run();
+    return;
+  }
+  await env.DB.prepare(
+    `INSERT INTO zoom_meetings (id, org_id, meeting_id, zoom_meeting_id, host_user_id, topic, start_time, duration_minutes, join_url, summary, summary_status, created_at, updated_at)
+     VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, NULL, 'pending', ?, ?)`
+  ).bind(genId("zm"), orgId, zoomMeetingId, hostMap ? hostMap.crm_user_id : null, obj.topic || null, obj.start_time || null, typeof obj.duration === "number" ? obj.duration : null, obj.join_url || null, now, now).run();
+}
+__name(reconcileMeetingLifecycle, "reconcileMeetingLifecycle");
+
+async function reconcileMeetingSummary(env, orgId, obj) {
+  const zoomMeetingId = String(obj.meeting_id || obj.id || obj.uuid || "");
+  if (!zoomMeetingId) return;
+  const summaryText = obj.summary_overview || (Array.isArray(obj.summary_details) ? JSON.stringify(obj.summary_details) : null);
+  if (!summaryText) return;
+  await env.DB.prepare(
+    "UPDATE zoom_meetings SET summary = ?, summary_status = 'available', updated_at = ? WHERE zoom_meeting_id = ?"
+  ).bind(summaryText, isoNow(), zoomMeetingId).run();
+}
+__name(reconcileMeetingSummary, "reconcileMeetingSummary");
+
+async function handleZoomPhoneUsers(env) {
+  // Owner/Admin-only, read-only. Lists real Zoom Phone users (id/email/ext)
+  // so an Owner can map a CRM user to the correct Zoom Phone identity once
+  // that CRM user has a Zoom Phone license. Never exposes tokens/secrets.
+  try {
+    const r = await zoomApiGet(env, "/phone/users?page_size=100");
+    if (!r.ok) return { ok: false, status: r.status, error: (r.body && r.body.message) || "Zoom API error" };
+    const users = Array.isArray(r.body && r.body.users) ? r.body.users : [];
+    return {
+      ok: true,
+      users: users.map(function(u) {
+        return { zoomUserId: u.user_id || u.id, email: u.email, name: [u.first_name, u.last_name].filter(Boolean).join(" "), extensionNumber: u.extension_number || u.ext || null, status: u.status || null };
+      })
+    };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+__name(handleZoomPhoneUsers, "handleZoomPhoneUsers");
+
+async function handleZoomPhoneMapping(request, env, user) {
+  if (request.method === "GET") {
+    const url = new URL(request.url);
+    const targetUserId = (user.isOwner && url.searchParams.get("userId")) || user.id;
+    const row = await findMappedZoomUser(env, user.orgId, targetUserId);
+    return json({ data: row || null });
+  }
+  if (request.method === "POST") {
+    if (!user.isOwner) return errorResponse("Forbidden: only Owner/Admin can map Zoom Phone identities", 403);
+    let body;
+    try { body = await request.json(); } catch (_) { return errorResponse("Invalid JSON body", 400); }
+    const crmUserId = body && body.crmUserId;
+    const zoomUserId = body && body.zoomUserId;
+    if (!crmUserId || !zoomUserId) return errorResponse("crmUserId and zoomUserId are required", 400);
+    const target = await env.DB.prepare("SELECT id FROM users WHERE id = ? AND org_id = ? AND deleted_at IS NULL").bind(crmUserId, user.orgId).first();
+    if (!target) return errorResponse("CRM user not found", 404);
+    const now = isoNow();
+    await env.DB.prepare(
+      `INSERT INTO zoom_phone_user_map (id, org_id, crm_user_id, zoom_user_id, zoom_extension, zoom_email, active, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
+       ON CONFLICT(org_id, crm_user_id) DO UPDATE SET zoom_user_id = excluded.zoom_user_id, zoom_extension = excluded.zoom_extension, zoom_email = excluded.zoom_email, active = 1, updated_at = excluded.updated_at`
+    ).bind(genId("zpm"), user.orgId, crmUserId, zoomUserId, body.zoomExtension || null, body.zoomEmail || null, now, now).run();
+    await logActivity(env, user, "map-zoom-phone-identity", "zoom_phone_user_map", crmUserId, null);
+    return json({ data: { ok: true } });
+  }
+  return errorResponse("Method not allowed", 405);
+}
+__name(handleZoomPhoneMapping, "handleZoomPhoneMapping");
 
 async function handleZoomDiagnostics(env) {
   // Access-gated, authenticated-CRM-user-only diagnostic endpoint. Confirms the
@@ -964,6 +1166,13 @@ var worker_default = { async fetch(e, r, t) {
   }
   if ("/api/zoom/diagnostics" === s && "GET" === e.method) {
     return withCors(await handleZoomDiagnostics(r), e);
+  }
+  if ("/api/zoom/phone-mapping" === s) {
+    return withCors(await handleZoomPhoneMapping(e, r, n), e);
+  }
+  if ("/api/zoom/phone-users" === s && "GET" === e.method) {
+    if (!n.isOwner) return withCors(errorResponse("Forbidden: only Owner/Admin can list Zoom Phone users", 403), e);
+    return withCors(json(await handleZoomPhoneUsers(r)), e);
   }
   if (RESOURCES[i]) {
     return withCors(await handleResourceRequest(e, r, n, i, d), e);
