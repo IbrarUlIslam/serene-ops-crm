@@ -1843,6 +1843,42 @@ async function handleZohoMessagesList(request, env, user) {
 }
 __name(handleZohoMessagesList, "handleZohoMessagesList");
 
+// Small CRM-side metadata layer for real Zoho messages -- claim/assignment
+// state and CRM contact linking. Never mirrors mail content, just a thin
+// cross-reference table keyed by the real Zoho message id.
+async function handleZohoMailMetaList(request, env, user) {
+  const url = new URL(request.url);
+  const folderId = url.searchParams.get("folderId");
+  const rows = folderId
+    ? await env.DB.prepare("SELECT * FROM zoho_mail_meta WHERE org_id = ? AND zoho_folder_id = ?").bind(user.orgId, folderId).all()
+    : await env.DB.prepare("SELECT * FROM zoho_mail_meta WHERE org_id = ?").bind(user.orgId).all();
+  const data = {};
+  (rows.results || []).forEach(function(r) {
+    data[r.zoho_message_id] = { contactId: r.matched_contact_id || null, claimedBy: r.claimed_by || null };
+  });
+  return json({ data });
+}
+__name(handleZohoMailMetaList, "handleZohoMailMetaList");
+
+async function handleZohoMailMetaPatch(request, env, user, messageId) {
+  let body;
+  try { body = await request.json(); } catch (e) { return errorResponse("Invalid JSON body", 400); }
+  const now = isoNow();
+  const existing = await env.DB.prepare("SELECT * FROM zoho_mail_meta WHERE org_id = ? AND zoho_message_id = ?").bind(user.orgId, messageId).first();
+  const contactId = body && Object.prototype.hasOwnProperty.call(body, "contactId") ? body.contactId : (existing ? existing.matched_contact_id : null);
+  const claimedBy = body && Object.prototype.hasOwnProperty.call(body, "claimedBy") ? body.claimedBy : (existing ? existing.claimed_by : null);
+  const folderId = (body && body.folderId) || (existing ? existing.zoho_folder_id : null);
+  if (existing) {
+    await env.DB.prepare("UPDATE zoho_mail_meta SET matched_contact_id = ?, claimed_by = ?, zoho_folder_id = COALESCE(?, zoho_folder_id), updated_at = ? WHERE org_id = ? AND zoho_message_id = ?")
+      .bind(contactId, claimedBy, folderId, now, user.orgId, messageId).run();
+  } else {
+    await env.DB.prepare("INSERT INTO zoho_mail_meta (id, org_id, zoho_message_id, zoho_folder_id, matched_contact_id, claimed_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+      .bind(genId("zmm"), user.orgId, messageId, folderId, contactId, claimedBy, now, now).run();
+  }
+  return json({ data: { messageId, contactId, claimedBy } });
+}
+__name(handleZohoMailMetaPatch, "handleZohoMailMetaPatch");
+
 async function handleZohoMessageContent(request, env, user, folderId, messageId) {
   try {
     const row = await requireZohoAccount(env, user.orgId);
@@ -2012,6 +2048,14 @@ var worker_default = { async fetch(e, r, t) {
   }
   if ("/api/zoho/mail/send" === s && "POST" === e.method) {
     return withCors(await handleZohoSend(e, r, n), e);
+  }
+  if ("/api/zoho/mail/meta" === s && "GET" === e.method) {
+    return withCors(await handleZohoMailMetaList(e, r, n), e);
+  }
+  if (s.startsWith("/api/zoho/mail/meta/") && "PATCH" === e.method) {
+    const metaMsgId = s.slice("/api/zoho/mail/meta/".length);
+    if (!metaMsgId) return withCors(errorResponse("Not found", 404), e);
+    return withCors(await handleZohoMailMetaPatch(e, r, n, metaMsgId), e);
   }
   if (s.startsWith("/api/zoho/mail/messages/") && s.endsWith("/action") && "POST" === e.method) {
     const parts0 = s.split("/");
