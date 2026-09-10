@@ -1846,6 +1846,33 @@ __name(handleZohoMessagesList, "handleZohoMessagesList");
 // Small CRM-side metadata layer for real Zoho messages -- claim/assignment
 // state and CRM contact linking. Never mirrors mail content, just a thin
 // cross-reference table keyed by the real Zoho message id.
+
+// Records CRM-side attribution for a message the CRM itself sent via Zoho
+// (new message, reply, reply-all, forward). Best-effort and non-blocking --
+// never throws back to the caller, so a logging failure never breaks a real
+// send. Does NOT duplicate the message content anywhere; only the Zoho
+// message id, thread id, sending CRM user, and (if supplied) linked contact.
+async function recordZohoSendAttribution(env, orgId, sentByEmail, contactId, folderId, responseData) {
+  try {
+    const d = responseData || {};
+    const messageId = d.messageId || d.message_id || (Array.isArray(d) && d[0] && (d[0].messageId || d[0].message_id));
+    if (!messageId) return;
+    const threadId = d.threadId || d.thread_id || null;
+    const now = isoNow();
+    const existing = await env.DB.prepare("SELECT * FROM zoho_mail_meta WHERE org_id = ? AND zoho_message_id = ?").bind(orgId, String(messageId)).first();
+    if (existing) {
+      await env.DB.prepare("UPDATE zoho_mail_meta SET sent_by_crm_user_id = ?, thread_id = COALESCE(?, thread_id), matched_contact_id = COALESCE(?, matched_contact_id), zoho_folder_id = COALESCE(?, zoho_folder_id), updated_at = ? WHERE org_id = ? AND zoho_message_id = ?")
+        .bind(sentByEmail, threadId, contactId || null, folderId || null, now, orgId, String(messageId)).run();
+    } else {
+      await env.DB.prepare("INSERT INTO zoho_mail_meta (id, org_id, zoho_message_id, zoho_folder_id, thread_id, matched_contact_id, sent_by_crm_user_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+        .bind(genId("zmm"), orgId, String(messageId), folderId || null, threadId, contactId || null, sentByEmail, now, now).run();
+    }
+  } catch (e) {
+    // Deliberately swallowed: attribution logging must never break a real send.
+  }
+}
+__name(recordZohoSendAttribution, "recordZohoSendAttribution");
+
 async function handleZohoMailMetaList(request, env, user) {
   const url = new URL(request.url);
   const folderId = url.searchParams.get("folderId");
@@ -1854,7 +1881,8 @@ async function handleZohoMailMetaList(request, env, user) {
     : await env.DB.prepare("SELECT * FROM zoho_mail_meta WHERE org_id = ?").bind(user.orgId).all();
   const data = {};
   (rows.results || []).forEach(function(r) {
-    data[r.zoho_message_id] = { contactId: r.matched_contact_id || null, claimedBy: r.claimed_by || null };
+    data[r.zoho_message_id] = { contactId: r.matched_contact_id || null, claimedBy: r.claimed_by || null,
+      sentBy: r.sent_by_crm_user_id || null, threadId: r.thread_id || null, createdAt: r.created_at || null };
   });
   return json({ data });
 }
@@ -1931,7 +1959,9 @@ async function handleZohoSend(request, env, user) {
     }
     const result = await zohoApiFetch(env, user.orgId, `/api/accounts/${row.zoho_account_id}/messages`, { method: "POST", json: payload });
     if (!result.ok) return errorResponse("Zoho send failed: " + JSON.stringify(result.body).slice(0, 300), 502);
-    return json({ data: (result.body && result.body.data) || { ok: true } });
+    const sentData = (result.body && result.body.data) || { ok: true };
+    await recordZohoSendAttribution(env, user.orgId, user.email || user.id || null, body.contactId || null, null, sentData);
+    return json({ data: sentData });
   } catch (e) {
     return errorResponse(e.message, 409);
   }
@@ -1954,9 +1984,14 @@ async function handleZohoReplyOrForward(request, env, user, messageId) {
       toAddress: mode === "forward" ? body.toAddress : undefined
     };
     if (mode === "forward" && !body.toAddress) return errorResponse("toAddress is required to forward", 400);
+    if (Array.isArray(body.attachmentIds) && body.attachmentIds.length) {
+      payload.attachments = body.attachmentIds.map(function(id) { return { storeName: "reserved", attachmentPath: id }; });
+    }
     const result = await zohoApiFetch(env, user.orgId, `/api/accounts/${row.zoho_account_id}/messages/${messageId}`, { method: "POST", json: payload });
     if (!result.ok) return errorResponse("Zoho reply/forward failed: " + JSON.stringify(result.body).slice(0, 300), 502);
-    return json({ data: (result.body && result.body.data) || { ok: true } });
+    const rfData = (result.body && result.body.data) || { ok: true };
+    await recordZohoSendAttribution(env, user.orgId, user.email || user.id || null, body.contactId || null, null, rfData);
+    return json({ data: rfData });
   } catch (e) {
     return errorResponse(e.message, 409);
   }
@@ -1990,7 +2025,10 @@ async function handleZohoAttachmentUpload(request, env, user) {
     const row = await requireZohoAccount(env, user.orgId);
     const tok = await getZohoAccessToken(env, user.orgId);
     const incomingCt = request.headers.get("content-type") || "application/octet-stream";
-    const resp = await fetch(`${tok.mailApiDomain}/api/accounts/${row.zoho_account_id}/messages/attachments`, {
+    const reqUrl = new URL(request.url);
+    const fileName = reqUrl.searchParams.get("fileName") || "attachment";
+    const attachQs = new URLSearchParams({ fileName, isInline: "false" });
+    const resp = await fetch(`${tok.mailApiDomain}/api/accounts/${row.zoho_account_id}/messages/attachments?${attachQs.toString()}`, {
       method: "POST",
       headers: { "Authorization": `Zoho-oauthtoken ${tok.accessToken}`, "Content-Type": incomingCt },
       body: request.body
