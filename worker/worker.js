@@ -732,10 +732,189 @@ async function logSystemAlert(env, jobName, errorMessage) {
   }
 }
 __name(logSystemAlert, "logSystemAlert");
+
+// ===== Zoom S2S OAuth + Webhook foundation (added Phase 3) =====
+
+var zoomTokenCache = { accessToken: null, expiresAt: 0 };
+
+async function getZoomAccessToken(env) {
+  const now = Date.now();
+  if (zoomTokenCache.accessToken && now < zoomTokenCache.expiresAt - 6e4) {
+    return zoomTokenCache.accessToken;
+  }
+  if (!env.ZOOM_ACCOUNT_ID || !env.ZOOM_CLIENT_ID || !env.ZOOM_CLIENT_SECRET) {
+    throw new Error("Zoom S2S OAuth credentials are not configured");
+  }
+  const basic = btoa(`${env.ZOOM_CLIENT_ID}:${env.ZOOM_CLIENT_SECRET}`);
+  const body = new URLSearchParams({ grant_type: "account_credentials", account_id: env.ZOOM_ACCOUNT_ID });
+  const resp = await fetch("https://zoom.us/oauth/token", {
+    method: "POST",
+    headers: {
+      "Authorization": `Basic ${basic}`,
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    body: body.toString()
+  });
+  if (!resp.ok) {
+    let detail = "";
+    try { detail = (await resp.text()).slice(0, 300); } catch (_) {}
+    throw new Error(`Zoom OAuth token request failed: HTTP ${resp.status} ${detail}`);
+  }
+  const data = await resp.json();
+  if (!data.access_token) throw new Error("Zoom OAuth response missing access_token");
+  zoomTokenCache.accessToken = data.access_token;
+  zoomTokenCache.expiresAt = now + (Number(data.expires_in) || 3600) * 1e3;
+  return zoomTokenCache.accessToken;
+}
+__name(getZoomAccessToken, "getZoomAccessToken");
+
+async function zoomApiGet(env, path) {
+  const token = await getZoomAccessToken(env);
+  const resp = await fetch(`https://api.zoom.us/v2${path}`, {
+    headers: { "Authorization": `Bearer ${token}` }
+  });
+  let body = null;
+  try { body = await resp.json(); } catch (_) {}
+  return { ok: resp.ok, status: resp.status, body };
+}
+__name(zoomApiGet, "zoomApiGet");
+
+async function hmacSha256Hex(secret, message) {
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey("raw", enc.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const sig = await crypto.subtle.sign("HMAC", key, enc.encode(message));
+  return Array.from(new Uint8Array(sig)).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+__name(hmacSha256Hex, "hmacSha256Hex");
+
+async function sha256Hex(message) {
+  const enc = new TextEncoder();
+  const digest = await crypto.subtle.digest("SHA-256", enc.encode(message));
+  return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+__name(sha256Hex, "sha256Hex");
+
+function timingSafeEqualStr(a, b) {
+  if (typeof a !== "string" || typeof b !== "string" || a.length !== b.length) return false;
+  let mismatch = 0;
+  for (let i = 0; i < a.length; i++) mismatch |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return mismatch === 0;
+}
+__name(timingSafeEqualStr, "timingSafeEqualStr");
+
+async function handleZoomWebhook(request, env) {
+  if (request.method !== "POST") return errorResponse("Method not allowed", 405);
+  if (!env.ZOOM_WEBHOOK_SECRET_TOKEN) {
+    console.error("ZOOM_WEBHOOK_SECRET_TOKEN not configured");
+    return errorResponse("Webhook not configured", 503);
+  }
+
+  const rawBody = await request.text();
+  const timestampHeader = request.headers.get("x-zm-request-timestamp") || "";
+  const signatureHeader = request.headers.get("x-zm-signature") || "";
+
+  let payload;
+  try {
+    payload = JSON.parse(rawBody);
+  } catch (_) {
+    return errorResponse("Malformed payload", 400);
+  }
+
+  // The endpoint URL validation handshake is unsigned by design (Zoom sends it
+  // before any secret exchange is possible), so it is handled before signature
+  // checks -- but it only ever computes a hash, never reads/writes CRM data.
+  if (payload && payload.event === "endpoint.url_validation" && payload.payload && payload.payload.plainToken) {
+    const encryptedToken = await hmacSha256Hex(env.ZOOM_WEBHOOK_SECRET_TOKEN, payload.payload.plainToken);
+    return json({ plainToken: payload.payload.plainToken, encryptedToken }, 200);
+  }
+
+  if (!timestampHeader || !signatureHeader) {
+    return errorResponse("Missing signature headers", 401);
+  }
+
+  // Reject stale/replayed requests: Zoom signs with a fresh timestamp on each
+  // delivery attempt, so anything outside a tight window is not a live delivery.
+  const tsNum = Number(timestampHeader);
+  if (!Number.isFinite(tsNum) || Math.abs(Date.now() - tsNum * 1e3) > 5 * 60 * 1e3) {
+    return errorResponse("Stale or invalid timestamp", 401);
+  }
+
+  const expectedSig = "v0=" + (await hmacSha256Hex(env.ZOOM_WEBHOOK_SECRET_TOKEN, `v0:${timestampHeader}:${rawBody}`));
+  if (!timingSafeEqualStr(expectedSig, signatureHeader)) {
+    return errorResponse("Invalid signature", 401);
+  }
+
+  // Idempotency: dedupe on a hash of the verified raw body. Zoom redelivers
+  // identical payloads on retry, so a duplicate insert here means "already seen".
+  const payloadHash = await sha256Hex(rawBody);
+  const eventType = typeof payload.event === "string" ? payload.event : "unknown";
+  try {
+    const result = await env.DB.prepare(
+      "INSERT OR IGNORE INTO zoom_webhook_events (id, event_type, payload_hash, processed) VALUES (?, ?, ?, 0)"
+    ).bind(genId("zwe"), eventType, payloadHash).run();
+    const alreadySeen = !(result.meta && result.meta.changes);
+    if (alreadySeen) {
+      return json({ received: true, duplicate: true }, 200);
+    }
+  } catch (e) {
+    console.error("zoom webhook idempotency insert failed", e.message);
+    return errorResponse("Internal error", 500);
+  }
+
+  // Foundation phase only: the event is durably recorded and de-duplicated.
+  // No downstream CRM records (calls/meetings/voicemails/reminders/Activity)
+  // are created yet -- that wiring is a later, separate phase per plan.
+  try {
+    await env.DB.prepare("UPDATE zoom_webhook_events SET processed = 1 WHERE payload_hash = ?").bind(payloadHash).run();
+  } catch (e) {
+    console.error("zoom webhook mark-processed failed", e.message);
+  }
+
+  return json({ received: true }, 200);
+}
+__name(handleZoomWebhook, "handleZoomWebhook");
+
+async function handleZoomDiagnostics(env) {
+  // Access-gated, authenticated-CRM-user-only diagnostic endpoint. Confirms the
+  // S2S OAuth helper works against real, safe, read-only Zoom endpoints. Never
+  // returns the access token or any secret -- only HTTP status + counts.
+  const out = { oauth: null, accountUsers: null, phoneUsers: null, phoneCallLogs: null };
+  try {
+    await getZoomAccessToken(env);
+    out.oauth = { ok: true };
+  } catch (e) {
+    out.oauth = { ok: false, error: e.message };
+    return json(out, 200);
+  }
+  try {
+    const r0 = await zoomApiGet(env, "/users?page_size=1");
+    out.accountUsers = { status: r0.status, ok: r0.ok, count: r0.body && typeof r0.body.total_records === "number" ? r0.body.total_records : null };
+  } catch (e) {
+    out.accountUsers = { ok: false, error: e.message };
+  }
+  try {
+    const r1 = await zoomApiGet(env, "/phone/users?page_size=1");
+    out.phoneUsers = { status: r1.status, ok: r1.ok, count: r1.body && typeof r1.body.total_records === "number" ? r1.body.total_records : null };
+  } catch (e) {
+    out.phoneUsers = { ok: false, error: e.message };
+  }
+  try {
+    const r2 = await zoomApiGet(env, "/phone/call_logs?page_size=1");
+    out.phoneCallLogs = { status: r2.status, ok: r2.ok, count: r2.body && typeof r2.body.total_records === "number" ? r2.body.total_records : null };
+  } catch (e) {
+    out.phoneCallLogs = { ok: false, error: e.message };
+  }
+  return json(out, 200);
+}
+__name(handleZoomDiagnostics, "handleZoomDiagnostics");
+
+// ===== end Zoom S2S OAuth + Webhook foundation =====
+
 var worker_default = { async fetch(e, r, t) {
   const s = new URL(e.url).pathname;
   if ("OPTIONS" === e.method) return new Response(null, { status: 204, headers: corsHeaders(e) });
   if ("/api/health" === s) return withCors(json({ status: "ok", time: isoNow() }), e);
+  if ("/zoom/webhook" === s) return handleZoomWebhook(e, r);
   if (!s.startsWith("/api/")) return errorResponse("Not found", 404);
   const o = await verifyAccessJwt(e, r);
   if (!o.ok) return withCors(errorResponse(o.error, o.status), e);
@@ -751,6 +930,9 @@ var worker_default = { async fetch(e, r, t) {
   if ("/api/me" === s) {
     const t2 = await r.DB.prepare("SELECT password_hash FROM users WHERE id = ?").bind(n.id).first();
     return withCors(meResponse(n, t2 && t2.password_hash), e);
+  }
+  if ("/api/zoom/diagnostics" === s && "GET" === e.method) {
+    return withCors(await handleZoomDiagnostics(r), e);
   }
   if (RESOURCES[i]) {
     return withCors(await handleResourceRequest(e, r, n, i, d), e);
