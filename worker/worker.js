@@ -2187,6 +2187,40 @@ async function handleZohoDraftDelete(request, env, user, folderId, draftId) {
 }
 __name(handleZohoDraftDelete, "handleZohoDraftDelete");
 
+// Zoho's real conversation identifier: a reply/forward carries a
+// "threadId" field pointing at the root message's own messageId (the root
+// message itself carries no threadId field). Zoho's search API does not
+// support filtering by threadId server-side (verified live 2026-09-10:
+// searchKey=threadid:<id> / threadId:<id> both silently ignore the filter
+// and return an unfiltered recent-messages listing), so grouping a full
+// conversation means fetching each of the account's main folders' own
+// listings and filtering client-side (here, worker-side) for rows whose
+// threadId equals the target, or whose own messageId IS the target (the
+// thread's root message never carries a threadId of its own).
+async function handleZohoThreadGet(request, env, user) {
+  const url = new URL(request.url);
+  const threadId = url.searchParams.get("threadId");
+  if (!threadId) return errorResponse("threadId is required", 400);
+  try {
+    const row = await requireZohoAccount(env, user.orgId);
+    const foldersResult = await zohoApiFetch(env, user.orgId, `/api/accounts/${row.zoho_account_id}/folders`);
+    const folders = (foldersResult.ok && foldersResult.body && foldersResult.body.data) || [];
+    const mainFolders = folders.filter(function(f) { return ["Inbox", "Sent", "Drafts"].indexOf(f.folderType) > -1; });
+    const perFolder = await Promise.all(mainFolders.map(async function(f) {
+      const qs = new URLSearchParams({ folderId: f.folderId, start: "1", limit: "200", sortBy: "date", sortorder: "false" });
+      const r = await zohoApiFetch(env, user.orgId, `/api/accounts/${row.zoho_account_id}/messages/view?${qs.toString()}`);
+      const rows = (r.ok && r.body && r.body.data) || [];
+      return rows.filter(function(m) { return String(m.threadId) === String(threadId) || String(m.messageId) === String(threadId); });
+    }));
+    const merged = [].concat.apply([], perFolder);
+    merged.sort(function(a, b) { return Number(a.receivedTime || 0) - Number(b.receivedTime || 0); });
+    return json({ data: merged, mailboxEmail: row.zoho_email });
+  } catch (e) {
+    return errorResponse(e.message, 409);
+  }
+}
+__name(handleZohoThreadGet, "handleZohoThreadGet");
+
 async function handleZohoAttachmentDownload(request, env, user, folderId, messageId, attachmentId) {
   try {
     const row = await requireZohoAccount(env, user.orgId);
@@ -2316,6 +2350,9 @@ var worker_default = { async fetch(e, r, t) {
   }
   if ("/api/zoho/mail/draft/send" === s && "POST" === e.method) {
     return withCors(await handleZohoDraftSend(e, r, n), e);
+  }
+  if ("/api/zoho/mail/thread" === s && "GET" === e.method) {
+    return withCors(await handleZohoThreadGet(e, r, n), e);
   }
   if (s.startsWith("/api/zoho/mail/draft/") && "DELETE" === e.method) {
     const draftParts = s.slice("/api/zoho/mail/draft/".length).split("/");
