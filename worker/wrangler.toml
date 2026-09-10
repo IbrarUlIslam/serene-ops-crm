@@ -1,0 +1,36 @@
+name = "serene-ops-crm-api"
+main = "worker.js"
+compatibility_date = "2026-09-04"
+
+# This file documents the EXISTING live configuration of the serene-ops-crm-api
+# Worker, verified against the Cloudflare dashboard on 2026-09-10. It is checked
+# in for reference / disaster recovery. It intentionally does NOT redeploy or
+# alter production on its own (no CI/CD is wired to this file yet) and it must
+# never contain secret VALUES.
+
+[[d1_databases]]
+binding = "DB"
+database_name = "serene-ops-crm-db"
+database_id = "f3d33499-438b-4f73-9024-9c307bb4eee4"
+
+[[r2_buckets]]
+binding = "FILES"
+bucket_name = "serene-ops-crm-files"
+
+[vars]
+# Plain-text (non-secret) vars, values match the live Worker exactly.
+ACCESS_AUD = "b63e75f3dcca3b6e6932f03bd32164d4b0f7a26ca39a1c69ffbe9c295c0c9312,a5a881ef401a82bf21bef53f789d9cacb09dcb9723546ab523accb2ac34d9bf8"
+ACCESS_TEAM_DOMAIN = "lucky-mouse-83d8.cloudflareaccess.com"
+
+# Secrets (NAMES ONLY — set with `wrangler secret put <NAME>`, never committed):
+#   ZOOM_ACCOUNT_ID
+#   ZOOM_CLIENT_ID
+#   ZOOM_CLIENT_SECRET
+#   ZOOM_WEBHOOK_SECRET_TOKEN
+
+[triggers]
+crons = ["*/15 * * * *", "0 20 * * *"]
+
+[[routes]]
+pattern = "crm.sereneop.com/api/*"
+zone_name = "sereneop.com"
