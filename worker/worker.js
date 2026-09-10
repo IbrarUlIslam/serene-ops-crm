@@ -2035,6 +2035,158 @@ async function handleZohoReplyOrForward(request, env, user, messageId) {
 }
 __name(handleZohoReplyOrForward, "handleZohoReplyOrForward");
 
+// Zoho's Mail API has no in-place "update draft" endpoint (verified live
+// 2026-09-10: POST .../messages/{id} always requires a reply/forward-style
+// "action" and rejects mode:"draft" there; PUT on that path 404s). Every
+// save therefore creates a fresh draft via POST .../messages with
+// mode:"draft", and -- when editing an existing draft -- best-effort
+// deletes (moves to trash, recoverable) the prior draft id so the Drafts
+// folder never shows more than one live copy for that compose session.
+// Zoho's attachmentinfo endpoint (used to list an existing message's
+// attachments) only returns {attachmentId, attachmentName, attachmentSize}
+// -- it never returns the storeName/attachmentPath pair the send/draft
+// APIs require to re-attach a file. So carrying an attachment forward
+// across a draft edit (which always creates a brand-new draft, see below)
+// means re-fetching that attachment's bytes from the OLD draft and
+// re-uploading them fresh to get a new storeName/attachmentPath the new
+// draft can reference. Best-effort per attachment: one failing carry-over
+// must never block saving the rest of the draft.
+async function zohoCarryOverAttachment(env, orgId, accountId, item) {
+  try {
+    const tok = await getZohoAccessToken(env, orgId);
+    const dlResp = await fetch(
+      `${tok.mailApiDomain}/api/accounts/${accountId}/folders/${item.folderId}/messages/${item.messageId}/attachments/${item.attachmentId}`,
+      { headers: { "Authorization": `Zoho-oauthtoken ${tok.accessToken}` } }
+    );
+    if (!dlResp.ok) return null;
+    const bytes = await dlResp.arrayBuffer();
+    const fileName = item.attachmentName || "attachment";
+    const upResp = await fetch(
+      `${tok.mailApiDomain}/api/accounts/${accountId}/messages/attachments?${new URLSearchParams({ fileName, isInline: "false" }).toString()}`,
+      { method: "POST", headers: { "Authorization": `Zoho-oauthtoken ${tok.accessToken}`, "Content-Type": "application/octet-stream" }, body: bytes }
+    );
+    const upJson = await upResp.json().catch(() => null);
+    if (!upResp.ok || !upJson || !upJson.data) return null;
+    return { storeName: upJson.data.storeName, attachmentPath: upJson.data.attachmentPath, attachmentName: fileName };
+  } catch (e) {
+    return null;
+  }
+}
+__name(zohoCarryOverAttachment, "zohoCarryOverAttachment");
+
+async function handleZohoDraftSave(request, env, user) {
+  let body;
+  try { body = await request.json(); } catch (e) { return errorResponse("Invalid JSON body", 400); }
+  if (!body || !body.toAddress) return errorResponse("toAddress is required", 400);
+  try {
+    const row = await requireZohoAccount(env, user.orgId);
+    const payload = {
+      mode: "draft",
+      fromAddress: row.zoho_email,
+      toAddress: body.toAddress,
+      ccAddress: body.ccAddress || undefined,
+      bccAddress: body.bccAddress || undefined,
+      subject: body.subject || "(No subject)",
+      content: body.content || "",
+      mailFormat: "html"
+    };
+    const attList = [];
+    if (Array.isArray(body.attachments) && body.attachments.length) {
+      body.attachments
+        .filter(function(a) { return a && a.attachmentPath && a.storeName; })
+        .forEach(function(a) { attList.push({ storeName: a.storeName, attachmentPath: a.attachmentPath, attachmentName: a.attachmentName || "attachment" }); });
+    }
+    if (Array.isArray(body.keepAttachments) && body.keepAttachments.length) {
+      const carried = await Promise.all(body.keepAttachments
+        .filter(function(a) { return a && a.folderId && a.messageId && a.attachmentId; })
+        .map(function(a) { return zohoCarryOverAttachment(env, user.orgId, row.zoho_account_id, a); }));
+      carried.filter(Boolean).forEach(function(a) { attList.push(a); });
+    }
+    if (attList.length) payload.attachments = attList;
+    const result = await zohoApiFetch(env, user.orgId, `/api/accounts/${row.zoho_account_id}/messages`, { method: "POST", json: payload });
+    if (!result.ok) return errorResponse("Zoho draft save failed: " + JSON.stringify(result.body).slice(0, 300), 502);
+    const draftData = (result.body && result.body.data) || {};
+    if (body.draftId && body.draftFolderId && String(body.draftId) !== String(draftData.messageId)) {
+      try {
+        await zohoApiFetch(env, user.orgId, `/api/accounts/${row.zoho_account_id}/folders/${body.draftFolderId}/messages/${body.draftId}`, { method: "DELETE" });
+      } catch (delErr) {
+        // Best-effort: the new draft already saved successfully; a failed
+        // cleanup of the stale prior draft must never surface as an error.
+      }
+    }
+    return json({ data: draftData });
+  } catch (e) {
+    return errorResponse(e.message, 409);
+  }
+}
+__name(handleZohoDraftSave, "handleZohoDraftSave");
+
+// Sends an existing draft. Zoho has no documented "convert draft to sent"
+// call, so this performs a real send (identical to New message) with the
+// draft's current fields, then best-effort deletes the now-superseded
+// draft. If the delete fails the mail has still genuinely sent -- a
+// leftover draft copy is a much safer failure mode than a silently
+// unsent message.
+async function handleZohoDraftSend(request, env, user) {
+  let body;
+  try { body = await request.json(); } catch (e) { return errorResponse("Invalid JSON body", 400); }
+  if (!body || !body.toAddress || !body.subject) return errorResponse("toAddress and subject are required", 400);
+  try {
+    const row = await requireZohoAccount(env, user.orgId);
+    const payload = {
+      fromAddress: row.zoho_email,
+      toAddress: body.toAddress,
+      ccAddress: body.ccAddress || undefined,
+      bccAddress: body.bccAddress || undefined,
+      subject: body.subject,
+      content: body.content || "",
+      askReceipt: "no"
+    };
+    const attList2 = [];
+    if (Array.isArray(body.attachments) && body.attachments.length) {
+      body.attachments
+        .filter(function(a) { return a && a.attachmentPath && a.storeName; })
+        .forEach(function(a) { attList2.push({ storeName: a.storeName, attachmentPath: a.attachmentPath, attachmentName: a.attachmentName || "attachment" }); });
+    }
+    if (Array.isArray(body.keepAttachments) && body.keepAttachments.length) {
+      const carried2 = await Promise.all(body.keepAttachments
+        .filter(function(a) { return a && a.folderId && a.messageId && a.attachmentId; })
+        .map(function(a) { return zohoCarryOverAttachment(env, user.orgId, row.zoho_account_id, a); }));
+      carried2.filter(Boolean).forEach(function(a) { attList2.push(a); });
+    }
+    if (attList2.length) payload.attachments = attList2;
+    const result = await zohoApiFetch(env, user.orgId, `/api/accounts/${row.zoho_account_id}/messages`, { method: "POST", json: payload });
+    if (!result.ok) return errorResponse("Zoho draft send failed: " + JSON.stringify(result.body).slice(0, 300), 502);
+    const sentData = (result.body && result.body.data) || { ok: true };
+    if (body.draftId && body.draftFolderId) {
+      try {
+        await zohoApiFetch(env, user.orgId, `/api/accounts/${row.zoho_account_id}/folders/${body.draftFolderId}/messages/${body.draftId}`, { method: "DELETE" });
+      } catch (delErr) {
+        // Best-effort cleanup only; the send itself already succeeded.
+      }
+    }
+    await recordZohoSendAttribution(env, user.orgId, user.email || user.id || null, body.contactId || null, null, sentData);
+    return json({ data: sentData });
+  } catch (e) {
+    return errorResponse(e.message, 409);
+  }
+}
+__name(handleZohoDraftSend, "handleZohoDraftSend");
+
+// Discards a draft: moves it to Trash (expunge=false), never a permanent
+// delete, so an accidental discard stays recoverable from the mailbox.
+async function handleZohoDraftDelete(request, env, user, folderId, draftId) {
+  try {
+    const row = await requireZohoAccount(env, user.orgId);
+    const result = await zohoApiFetch(env, user.orgId, `/api/accounts/${row.zoho_account_id}/folders/${folderId}/messages/${draftId}`, { method: "DELETE" });
+    if (!result.ok) return errorResponse("Zoho draft delete failed: " + JSON.stringify(result.body).slice(0, 300), 502);
+    return json({ data: { ok: true } });
+  } catch (e) {
+    return errorResponse(e.message, 409);
+  }
+}
+__name(handleZohoDraftDelete, "handleZohoDraftDelete");
+
 async function handleZohoAttachmentDownload(request, env, user, folderId, messageId, attachmentId) {
   try {
     const row = await requireZohoAccount(env, user.orgId);
@@ -2158,6 +2310,18 @@ var worker_default = { async fetch(e, r, t) {
     const [folderId2, messageId2] = parts2;
     if (!folderId2 || !messageId2) return withCors(errorResponse("Not found", 404), e);
     return withCors(await handleZohoMessageContent(e, r, n, folderId2, messageId2), e);
+  }
+  if ("/api/zoho/mail/draft" === s && "POST" === e.method) {
+    return withCors(await handleZohoDraftSave(e, r, n), e);
+  }
+  if ("/api/zoho/mail/draft/send" === s && "POST" === e.method) {
+    return withCors(await handleZohoDraftSend(e, r, n), e);
+  }
+  if (s.startsWith("/api/zoho/mail/draft/") && "DELETE" === e.method) {
+    const draftParts = s.slice("/api/zoho/mail/draft/".length).split("/");
+    const [draftFolderId3, draftId3] = draftParts;
+    if (!draftFolderId3 || !draftId3) return withCors(errorResponse("Not found", 404), e);
+    return withCors(await handleZohoDraftDelete(e, r, n, draftFolderId3, draftId3), e);
   }
   if ("/api/zoom/diagnostics" === s && "GET" === e.method) {
     return withCors(await handleZoomDiagnostics(r), e);
