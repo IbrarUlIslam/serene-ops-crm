@@ -1,6 +1,14 @@
 name = "serene-ops-crm-api"
 main = "worker.js"
 compatibility_date = "2026-09-04"
+workers_dev = true
+preview_urls = true
+
+[observability]
+enabled = true
+
+[observability.logs]
+enabled = true
 
 # This file documents the EXISTING live configuration of the serene-ops-crm-api
 # Worker, verified against the Cloudflare dashboard on 2026-09-10. It is checked
