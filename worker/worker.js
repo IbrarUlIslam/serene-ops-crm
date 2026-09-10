@@ -904,6 +904,37 @@ async function handleZoomDiagnostics(env) {
   } catch (e) {
     out.phoneCallLogs = { ok: false, error: e.message };
   }
+
+  // Additive: meetings list + one meeting detail + one meeting summary, all
+  // read-only, scoped to whichever Zoom user we can discover from the phone
+  // users list above. Never returns PII beyond counts/ids/topics already
+  // visible in the CRM's own Zoom Phone user list.
+  out.meetings = null;
+  out.meetingDetail = null;
+  out.meetingSummary = null;
+  try {
+    const pu = await zoomApiGet(env, "/phone/users?page_size=1");
+    const userId = pu.body && Array.isArray(pu.body.users) && pu.body.users[0] ? (pu.body.users[0].user_id || pu.body.users[0].id) : null;
+    if (!userId) {
+      out.meetings = { ok: false, error: "No Zoom user id available from phone/users to query meetings for" };
+    } else {
+      const rm = await zoomApiGet(env, `/users/${userId}/meetings?type=previous_meetings&page_size=1`);
+      out.meetings = { status: rm.status, ok: rm.ok, count: rm.body && typeof rm.body.total_records === "number" ? rm.body.total_records : null };
+      const firstMeeting = rm.body && Array.isArray(rm.body.meetings) ? rm.body.meetings[0] : null;
+      if (firstMeeting && firstMeeting.id) {
+        const rd = await zoomApiGet(env, `/meetings/${firstMeeting.id}`);
+        out.meetingDetail = { status: rd.status, ok: rd.ok, hasTopic: !!(rd.body && rd.body.topic), hasStartTime: !!(rd.body && rd.body.start_time) };
+        const rs = await zoomApiGet(env, `/meetings/${firstMeeting.id}/meeting_summary`);
+        out.meetingSummary = { status: rs.status, ok: rs.ok, hasSummary: !!(rs.body && (rs.body.summary_overview || rs.body.summary_details)) };
+      } else {
+        out.meetingDetail = { ok: false, error: "No prior meetings found to query" };
+        out.meetingSummary = { ok: false, error: "No prior meetings found to query" };
+      }
+    }
+  } catch (e) {
+    out.meetings = out.meetings || { ok: false, error: e.message };
+  }
+
   return json(out, 200);
 }
 __name(handleZoomDiagnostics, "handleZoomDiagnostics");
