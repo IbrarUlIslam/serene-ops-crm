@@ -263,6 +263,61 @@ function meResponse(e, r) {
   return json({ id: e.id, email: e.email, name: e.name, role: e.roleCode, roleName: e.roleName, isOwner: e.isOwner, permissions: Array.from(e.permissions), hasPasswordSet: !!r });
 }
 __name(meResponse, "meResponse");
+function mergeZoomMeetings(existingMeetings, zoomRows) {
+  // Overlays live Zoom-sourced fields from zoom_crm_meetings onto whatever
+  // the client already has for that meeting, so a client's own edits
+  // (contact/deal link, internal notes, archive, or a manual summary
+  // override) survive, while the Zoom-owned fields (topic, host, status,
+  // times, and the AI Companion summary unless the user overrode it with
+  // their own) are always the freshest real data, read directly from a
+  // dedicated table rather than depending on any client ever having saved
+  // them into crm_snapshot.
+  const list = Array.isArray(existingMeetings) ? existingMeetings : [];
+  const byZoomId = {};
+  for (const m of list) {
+    if (m && m.zoom_meeting_id) byZoomId[m.zoom_meeting_id] = m;
+  }
+  const nonZoom = list.filter(function(m) { return !(m && m.zoom_meeting_id); });
+  const merged = [];
+  for (const row of zoomRows) {
+    const prior = byZoomId[row.zoom_meeting_id];
+    const m = prior ? Object.assign({}, prior) : {
+      id: row.id,
+      kind: null,
+      attendees: [],
+      matched_contact_id: null,
+      contact_id: null,
+      matched_deal_id: null,
+      match_state: "unmatched",
+      internal_notes: null,
+      archived_at: null
+    };
+    m.id = m.id || row.id;
+    m.zoom_meeting_id = row.zoom_meeting_id;
+    m.zoom_uuid = row.zoom_uuid;
+    m.zoom_topic = row.zoom_topic;
+    m.zoom_host = row.zoom_host;
+    m.zoom_status = row.zoom_status;
+    m.at = row.at;
+    m.timezone = row.timezone;
+    m.meeting_duration_seconds = row.meeting_duration_seconds;
+    m.meeting_ended_at = row.meeting_ended_at;
+    if (!m.assignee || m.assignee === "Unassigned") m.assignee = row.assignee || "Unassigned";
+    if (!prior || prior.summary_source !== "manual") {
+      m.summary_status = row.summary_status;
+      m.summary_source = row.summary_source;
+      m.summary_overview = row.summary_overview;
+      m.summary_text = row.summary_text;
+      m.summary_details = row.summary_details ? JSON.parse(row.summary_details) : [];
+      m.summary_next_steps = row.summary_next_steps ? JSON.parse(row.summary_next_steps) : [];
+      m.summary_created_at = row.summary_created_at;
+    }
+    merged.push(m);
+  }
+  return nonZoom.concat(merged);
+}
+__name(mergeZoomMeetings, "mergeZoomMeetings");
+
 async function handleDbBlobRequest(e, r, t) {
   if ("GET" === e.method) {
     const e2 = await r.DB.prepare("SELECT data, updated_at, updated_by FROM crm_snapshot WHERE org_id = ?").bind(t.orgId).first();
@@ -272,6 +327,12 @@ async function handleDbBlobRequest(e, r, t) {
       s = JSON.parse(e2.data);
     } catch (e3) {
       return errorResponse("Stored snapshot is corrupted; contact the Owner/Admin", 500);
+    }
+    try {
+      const zoomRows = (await r.DB.prepare("SELECT * FROM zoom_crm_meetings WHERE org_id = ?").bind(t.orgId).all()).results || [];
+      if (zoomRows.length) s.meetings = mergeZoomMeetings(s.meetings, zoomRows);
+    } catch (e4) {
+      console.error("zoom meeting merge-on-read failed", e4.message);
     }
     return json({ data: s, updatedAt: e2.updated_at, updatedBy: e2.updated_by });
   }
@@ -1071,6 +1132,62 @@ async function resolveHostDisplayName(env, orgId, hostMap, obj) {
 }
 __name(resolveHostDisplayName, "resolveHostDisplayName");
 
+async function backfillMeetingSyncFromLedger(env, orgId) {
+  // Repair/repopulate tool: replays what the zoom_meetings ledger already
+  // durably recorded from real Zoom webhook deliveries into
+  // zoom_crm_meetings (the table merged into data.meetings at GET /api/db
+  // read time -- see mergeZoomMeetings). Uses only data Zoom itself already
+  // delivered and we already stored -- never invents anything. Each row is
+  // a plain single-row upsert, so this is safe to call repeatedly.
+  const rows = (await env.DB.prepare(
+    "SELECT zoom_meeting_id, host_user_id, topic, start_time, duration_minutes, summary, summary_status FROM zoom_meetings WHERE org_id = ?"
+  ).bind(orgId).all()).results || [];
+  const hostNames = {};
+  for (const row of rows) {
+    if (row.host_user_id && !(row.host_user_id in hostNames)) {
+      const u = await env.DB.prepare("SELECT name FROM users WHERE id = ? AND org_id = ?").bind(row.host_user_id, orgId).first();
+      hostNames[row.host_user_id] = (u && u.name) || null;
+    }
+  }
+  let touched = 0;
+  const now = isoNow();
+  for (const row of rows) {
+    const zoomMeetingId = row.zoom_meeting_id;
+    if (!zoomMeetingId) continue;
+    const hostName = hostNames[row.host_user_id] || null;
+    const existing = await env.DB.prepare(
+      "SELECT id FROM zoom_crm_meetings WHERE org_id = ? AND zoom_meeting_id = ? AND zoom_uuid IS NULL"
+    ).bind(orgId, zoomMeetingId).first();
+    if (existing) {
+      await env.DB.prepare(
+        `UPDATE zoom_crm_meetings SET
+           zoom_topic = COALESCE(?, zoom_topic), zoom_host = COALESCE(?, zoom_host),
+           at = COALESCE(?, at), meeting_duration_seconds = COALESCE(?, meeting_duration_seconds),
+           summary_status = CASE WHEN ? = 'available' THEN 'available' ELSE summary_status END,
+           summary_source = CASE WHEN ? = 'available' AND summary_source IS NULL THEN 'zoom_ai_companion' ELSE summary_source END,
+           summary_overview = CASE WHEN summary_overview IS NULL THEN ? ELSE summary_overview END,
+           updated_at = ?
+         WHERE id = ?`
+      ).bind(row.topic || null, hostName, row.start_time || null, typeof row.duration_minutes === "number" ? row.duration_minutes * 60 : null, row.summary_status, row.summary_status, row.summary, now, existing.id).run();
+    } else {
+      await env.DB.prepare(
+        `INSERT INTO zoom_crm_meetings (id, org_id, zoom_meeting_id, zoom_uuid, zoom_topic, zoom_host, zoom_status, assignee, at, meeting_duration_seconds, summary_status, summary_source, summary_overview, summary_created_at, created_at, updated_at)
+         VALUES (?, ?, ?, NULL, ?, ?, 'ended', ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).bind(
+        genId("meet"), orgId, zoomMeetingId, row.topic || null, hostName, hostName || "Unassigned",
+        row.start_time || now, typeof row.duration_minutes === "number" ? row.duration_minutes * 60 : null,
+        row.summary_status === "available" ? "available" : "none",
+        row.summary_status === "available" ? "zoom_ai_companion" : null,
+        row.summary_status === "available" ? row.summary : null,
+        row.summary_status === "available" ? now : null, now, now
+      ).run();
+    }
+    touched++;
+  }
+  return { rowsConsidered: rows.length, touched };
+}
+__name(backfillMeetingSyncFromLedger, "backfillMeetingSyncFromLedger");
+
 async function reconcileMeetingLifecycle(env, orgId, eventType, obj) {
   const zoomUuid = obj.uuid || obj.meeting_uuid || null;
   const zoomMeetingId = String(obj.id || zoomUuid || "");
@@ -1095,59 +1212,55 @@ async function reconcileMeetingLifecycle(env, orgId, eventType, obj) {
     ).bind(genId("zm"), orgId, zoomMeetingId, hostMap ? hostMap.crm_user_id : null, obj.topic || null, obj.start_time || null, typeof obj.duration === "number" ? obj.duration : null, obj.join_url || null, now, now).run();
   }
 
-  // CRM-visible record: the same crm_snapshot.meetings array the Meetings UI
-  // reads via /api/db (its own empty-state copy says "Zoom meetings appear
-  // here once it is connected, or add one by hand" -- so this is the only
-  // path that ever populates a real Zoom meeting there). Matched on the
-  // per-occurrence Zoom uuid when available so recurring meetings don't
-  // collide into one row; falls back to the reusable numeric meeting id
-  // only when no uuid was ever supplied.
-  await mutateOrgSnapshot(env, orgId, function(data) {
-    let m = data.meetings.find(function(x) {
-      return (zoomUuid && x.zoom_uuid === zoomUuid) || (!zoomUuid && !x.zoom_uuid && x.zoom_meeting_id === zoomMeetingId);
-    });
-    if (!m) {
-      m = {
-        id: genId("meet"),
-        at: obj.start_time || now,
-        kind: null,
-        zoom_topic: obj.topic || null,
-        zoom_meeting_id: zoomMeetingId,
-        zoom_uuid: zoomUuid,
-        zoom_host: hostDisplayName,
-        zoom_status: eventType === "meeting.ended" ? "ended" : "started",
-        assignee: hostDisplayName || "Unassigned",
-        attendees: [],
-        matched_contact_id: null,
-        contact_id: null,
-        matched_deal_id: null,
-        match_state: "unmatched",
-        summary_status: "none",
-        summary_source: null,
-        timezone: obj.timezone || null,
-        meeting_duration_seconds: null,
-        meeting_ended_at: null,
-        archived_at: null,
-        created_via: "zoom_webhook"
-      };
-      data.meetings.push(m);
-    }
-    if (obj.topic) m.zoom_topic = obj.topic;
-    if (obj.start_time) m.at = obj.start_time;
-    if (obj.timezone) m.timezone = obj.timezone;
-    if (hostDisplayName) {
-      m.zoom_host = hostDisplayName;
-      if (!m.assignee || m.assignee === "Unassigned") m.assignee = hostDisplayName;
-    }
-    if (eventType === "meeting.ended") {
-      m.zoom_status = "ended";
-      m.meeting_ended_at = obj.end_time || now;
-      if (typeof obj.duration === "number") m.meeting_duration_seconds = obj.duration * 60;
-    } else if (m.zoom_status !== "ended") {
-      m.zoom_status = "started";
-    }
-    return true;
-  });
+  // CRM-visible record: zoom_crm_meetings, merged into data.meetings at
+  // GET /api/db read time (see mergeZoomMeetings) rather than written into
+  // the crm_snapshot blob directly. A single-row UPSERT here is naturally
+  // race-free (D1 handles it atomically per row), unlike a blob rewrite,
+  // which a stale browser tab's own full-blob save can silently clobber
+  // either before or after this write lands -- that failure mode was
+  // observed in the first live test and is why this table exists. Matched
+  // on the per-occurrence Zoom uuid when available so recurring meetings
+  // don't collide into one row; falls back to the reusable numeric meeting
+  // id only when no uuid was ever supplied.
+  const matchCol = zoomUuid ? "zoom_uuid = ?" : "zoom_meeting_id = ? AND zoom_uuid IS NULL";
+  const matchVal = zoomUuid || zoomMeetingId;
+  const existingCrm = await env.DB.prepare(
+    `SELECT id, zoom_status FROM zoom_crm_meetings WHERE org_id = ? AND ${matchCol}`
+  ).bind(orgId, matchVal).first();
+  const newStatus = eventType === "meeting.ended" ? "ended" : "started";
+  if (existingCrm) {
+    const finalStatus = eventType === "meeting.ended" ? "ended" : (existingCrm.zoom_status === "ended" ? "ended" : "started");
+    await env.DB.prepare(
+      `UPDATE zoom_crm_meetings SET
+         zoom_topic = COALESCE(?, zoom_topic),
+         zoom_host = COALESCE(?, zoom_host),
+         assignee = CASE WHEN assignee IS NULL OR assignee = 'Unassigned' THEN COALESCE(?, assignee) ELSE assignee END,
+         at = COALESCE(?, at),
+         timezone = COALESCE(?, timezone),
+         zoom_status = ?,
+         meeting_ended_at = COALESCE(?, meeting_ended_at),
+         meeting_duration_seconds = COALESCE(?, meeting_duration_seconds),
+         updated_at = ?
+       WHERE id = ?`
+    ).bind(
+      obj.topic || null, hostDisplayName || null, hostDisplayName || null,
+      obj.start_time || null, obj.timezone || null, finalStatus,
+      eventType === "meeting.ended" ? (obj.end_time || now) : null,
+      eventType === "meeting.ended" && typeof obj.duration === "number" ? obj.duration * 60 : null,
+      now, existingCrm.id
+    ).run();
+  } else {
+    await env.DB.prepare(
+      `INSERT INTO zoom_crm_meetings (id, org_id, zoom_meeting_id, zoom_uuid, zoom_topic, zoom_host, zoom_status, assignee, at, timezone, meeting_duration_seconds, meeting_ended_at, summary_status, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'none', ?, ?)`
+    ).bind(
+      genId("meet"), orgId, zoomMeetingId, zoomUuid, obj.topic || null, hostDisplayName || null, newStatus,
+      hostDisplayName || "Unassigned", obj.start_time || now, obj.timezone || null,
+      eventType === "meeting.ended" && typeof obj.duration === "number" ? obj.duration * 60 : null,
+      eventType === "meeting.ended" ? (obj.end_time || now) : null,
+      now, now
+    ).run();
+  }
 }
 __name(reconcileMeetingLifecycle, "reconcileMeetingLifecycle");
 
@@ -1173,49 +1286,36 @@ async function reconcileMeetingSummary(env, orgId, obj) {
     "UPDATE zoom_meetings SET summary = ?, summary_status = 'available', updated_at = ? WHERE zoom_meeting_id = ?"
   ).bind(overview || fullText || JSON.stringify(details), now, zoomMeetingId).run();
 
-  await mutateOrgSnapshot(env, orgId, function(data) {
-    let m = data.meetings.find(function(x) {
-      return (zoomUuid && x.zoom_uuid === zoomUuid) || (!zoomUuid && !x.zoom_uuid && x.zoom_meeting_id === zoomMeetingId);
-    });
-    if (!m) {
-      // A summary can in principle arrive without a lifecycle event we
-      // captured first -- still record it rather than silently dropping a
-      // real Zoom AI Companion summary. Never fabricate anything beyond
-      // what this event itself tells us.
-      m = {
-        id: genId("meet"),
-        at: now,
-        kind: null,
-        zoom_topic: null,
-        zoom_meeting_id: zoomMeetingId,
-        zoom_uuid: zoomUuid,
-        zoom_host: null,
-        zoom_status: "ended",
-        assignee: "Unassigned",
-        attendees: [],
-        matched_contact_id: null,
-        contact_id: null,
-        matched_deal_id: null,
-        match_state: "unmatched",
-        summary_status: "none",
-        summary_source: null,
-        timezone: null,
-        meeting_duration_seconds: null,
-        meeting_ended_at: null,
-        archived_at: null,
-        created_via: "zoom_webhook"
-      };
-      data.meetings.push(m);
-    }
-    m.summary_status = "available";
-    m.summary_source = "zoom_ai_companion";
-    if (overview) m.summary_overview = overview;
-    if (fullText) m.summary_text = fullText;
-    if (details.length) m.summary_details = details;
-    if (steps.length) m.summary_next_steps = steps;
-    m.summary_created_at = now;
-    return true;
-  });
+  // Same race-free single-row upsert pattern as reconcileMeetingLifecycle,
+  // against zoom_crm_meetings (merged into data.meetings at GET time).
+  const matchCol = zoomUuid ? "zoom_uuid = ?" : "zoom_meeting_id = ? AND zoom_uuid IS NULL";
+  const matchVal = zoomUuid || zoomMeetingId;
+  const existingCrm = await env.DB.prepare(
+    `SELECT id FROM zoom_crm_meetings WHERE org_id = ? AND ${matchCol}`
+  ).bind(orgId, matchVal).first();
+  const detailsJson = details.length ? JSON.stringify(details) : null;
+  const stepsJson = steps.length ? JSON.stringify(steps) : null;
+  if (existingCrm) {
+    await env.DB.prepare(
+      `UPDATE zoom_crm_meetings SET
+         summary_status = 'available', summary_source = 'zoom_ai_companion',
+         summary_overview = COALESCE(?, summary_overview),
+         summary_text = COALESCE(?, summary_text),
+         summary_details = COALESCE(?, summary_details),
+         summary_next_steps = COALESCE(?, summary_next_steps),
+         summary_created_at = ?, updated_at = ?
+       WHERE id = ?`
+    ).bind(overview || null, fullText || null, detailsJson, stepsJson, now, now, existingCrm.id).run();
+  } else {
+    // A summary can in principle arrive without a lifecycle event we
+    // captured first -- still record it rather than silently dropping a
+    // real Zoom AI Companion summary. Never fabricate anything beyond what
+    // this event itself tells us.
+    await env.DB.prepare(
+      `INSERT INTO zoom_crm_meetings (id, org_id, zoom_meeting_id, zoom_uuid, zoom_status, assignee, summary_status, summary_source, summary_overview, summary_text, summary_details, summary_next_steps, summary_created_at, created_at, updated_at)
+       VALUES (?, ?, ?, ?, 'ended', 'Unassigned', 'available', 'zoom_ai_companion', ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(genId("meet"), orgId, zoomMeetingId, zoomUuid, overview || null, fullText || null, detailsJson, stepsJson, now, now, now).run();
+  }
 }
 __name(reconcileMeetingSummary, "reconcileMeetingSummary");
 
@@ -1365,6 +1465,15 @@ var worker_default = { async fetch(e, r, t) {
   if ("/api/zoom/phone-users" === s && "GET" === e.method) {
     if (!n.isOwner) return withCors(errorResponse("Forbidden: only Owner/Admin can list Zoom Phone users", 403), e);
     return withCors(json(await handleZoomPhoneUsers(r)), e);
+  }
+  // Standing owner-only repair tool: replays already-real, already-stored
+  // zoom_meetings ledger rows into zoom_crm_meetings (the table merged into
+  // /api/db at read time). Safe to keep -- idempotent, touches only rows
+  // Zoom itself already delivered, never invents data. Useful if
+  // zoom_crm_meetings ever needs reseeding from the ledger.
+  if ("/api/zoom/diagnostics/backfill-meeting-sync" === s && "POST" === e.method) {
+    if (!n.isOwner) return withCors(errorResponse("Forbidden: only Owner/Admin can run this", 403), e);
+    return withCors(json(await backfillMeetingSyncFromLedger(r, n.orgId)), e);
   }
   if (RESOURCES[i]) {
     return withCors(await handleResourceRequest(e, r, n, i, d), e);
