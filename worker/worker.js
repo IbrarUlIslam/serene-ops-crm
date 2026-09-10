@@ -1001,34 +1001,194 @@ async function reconcileVoicemailReceived(env, orgId, obj) {
 }
 __name(reconcileVoicemailReceived, "reconcileVoicemailReceived");
 
+async function mutateOrgSnapshot(env, orgId, mutatorFn) {
+  // Server-side, best-effort read-modify-write of the org's single crm_snapshot
+  // JSON blob -- the same store the frontend's GET/PUT /api/db reads and
+  // writes. This is the established pattern other server-side jobs
+  // (automations engine, contract-deadline checks) already use to add
+  // CRM-visible records. A user's own browser PUT can still race this (the
+  // whole blob is last-write-wins), the same accepted trade-off those other
+  // jobs already carry -- not a new risk introduced here.
+  const row = await env.DB.prepare("SELECT data FROM crm_snapshot WHERE org_id = ?").bind(orgId).first();
+  let data = {};
+  if (row && row.data) {
+    try {
+      data = JSON.parse(row.data);
+    } catch (e) {
+      console.error("crm_snapshot corrupted, skipping server-side meeting sync", e.message);
+      return;
+    }
+  }
+  if (!Array.isArray(data.meetings)) data.meetings = [];
+  const changed = mutatorFn(data);
+  if (!changed) return;
+  const now = isoNow();
+  await env.DB.prepare(
+    `INSERT INTO crm_snapshot (org_id, data, updated_at, updated_by)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(org_id) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at, updated_by = excluded.updated_by`
+  ).bind(orgId, JSON.stringify(data), now, "system:zoom").run();
+}
+__name(mutateOrgSnapshot, "mutateOrgSnapshot");
+
+async function resolveHostDisplayName(env, orgId, hostMap, obj) {
+  if (hostMap && hostMap.crm_user_id) {
+    try {
+      const u = await env.DB.prepare("SELECT name FROM users WHERE id = ? AND org_id = ?").bind(hostMap.crm_user_id, orgId).first();
+      if (u && u.name) return u.name;
+    } catch (e) {
+      // fall through to the raw Zoom identifiers below
+    }
+  }
+  return obj.host_email || obj.host_id || null;
+}
+__name(resolveHostDisplayName, "resolveHostDisplayName");
+
 async function reconcileMeetingLifecycle(env, orgId, eventType, obj) {
-  const zoomMeetingId = String(obj.id || obj.uuid || "");
+  const zoomUuid = obj.uuid || obj.meeting_uuid || null;
+  const zoomMeetingId = String(obj.id || zoomUuid || "");
   if (!zoomMeetingId) return;
   const hostZoomUserId = obj.host_id || null;
   const hostMap = hostZoomUserId ? await findCrmUserByZoomUserId(env, orgId, hostZoomUserId) : null;
-  const existing = await env.DB.prepare("SELECT id FROM zoom_meetings WHERE zoom_meeting_id = ?").bind(zoomMeetingId).first();
+  const hostDisplayName = await resolveHostDisplayName(env, orgId, hostMap, obj);
   const now = isoNow();
-  if (existing) {
+
+  // Internal ledger (zoom_meetings): a raw record of what Zoom told us,
+  // independent of the user-editable CRM meeting record below. Kept as-is
+  // for audit/reconciliation purposes.
+  const existingLedger = await env.DB.prepare("SELECT id FROM zoom_meetings WHERE zoom_meeting_id = ?").bind(zoomMeetingId).first();
+  if (existingLedger) {
     await env.DB.prepare(
       "UPDATE zoom_meetings SET topic = COALESCE(?, topic), start_time = COALESCE(?, start_time), duration_minutes = COALESCE(?, duration_minutes), host_user_id = COALESCE(host_user_id, ?), updated_at = ? WHERE id = ?"
-    ).bind(obj.topic || null, obj.start_time || null, typeof obj.duration === "number" ? obj.duration : null, hostMap ? hostMap.crm_user_id : null, now, existing.id).run();
-    return;
+    ).bind(obj.topic || null, obj.start_time || null, typeof obj.duration === "number" ? obj.duration : null, hostMap ? hostMap.crm_user_id : null, now, existingLedger.id).run();
+  } else {
+    await env.DB.prepare(
+      `INSERT INTO zoom_meetings (id, org_id, meeting_id, zoom_meeting_id, host_user_id, topic, start_time, duration_minutes, join_url, summary, summary_status, created_at, updated_at)
+       VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, NULL, 'pending', ?, ?)`
+    ).bind(genId("zm"), orgId, zoomMeetingId, hostMap ? hostMap.crm_user_id : null, obj.topic || null, obj.start_time || null, typeof obj.duration === "number" ? obj.duration : null, obj.join_url || null, now, now).run();
   }
-  await env.DB.prepare(
-    `INSERT INTO zoom_meetings (id, org_id, meeting_id, zoom_meeting_id, host_user_id, topic, start_time, duration_minutes, join_url, summary, summary_status, created_at, updated_at)
-     VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, NULL, 'pending', ?, ?)`
-  ).bind(genId("zm"), orgId, zoomMeetingId, hostMap ? hostMap.crm_user_id : null, obj.topic || null, obj.start_time || null, typeof obj.duration === "number" ? obj.duration : null, obj.join_url || null, now, now).run();
+
+  // CRM-visible record: the same crm_snapshot.meetings array the Meetings UI
+  // reads via /api/db (its own empty-state copy says "Zoom meetings appear
+  // here once it is connected, or add one by hand" -- so this is the only
+  // path that ever populates a real Zoom meeting there). Matched on the
+  // per-occurrence Zoom uuid when available so recurring meetings don't
+  // collide into one row; falls back to the reusable numeric meeting id
+  // only when no uuid was ever supplied.
+  await mutateOrgSnapshot(env, orgId, function(data) {
+    let m = data.meetings.find(function(x) {
+      return (zoomUuid && x.zoom_uuid === zoomUuid) || (!zoomUuid && !x.zoom_uuid && x.zoom_meeting_id === zoomMeetingId);
+    });
+    if (!m) {
+      m = {
+        id: genId("meet"),
+        at: obj.start_time || now,
+        kind: null,
+        zoom_topic: obj.topic || null,
+        zoom_meeting_id: zoomMeetingId,
+        zoom_uuid: zoomUuid,
+        zoom_host: hostDisplayName,
+        zoom_status: eventType === "meeting.ended" ? "ended" : "started",
+        assignee: hostDisplayName || "Unassigned",
+        attendees: [],
+        matched_contact_id: null,
+        contact_id: null,
+        matched_deal_id: null,
+        match_state: "unmatched",
+        summary_status: "none",
+        summary_source: null,
+        timezone: obj.timezone || null,
+        meeting_duration_seconds: null,
+        meeting_ended_at: null,
+        archived_at: null,
+        created_via: "zoom_webhook"
+      };
+      data.meetings.push(m);
+    }
+    if (obj.topic) m.zoom_topic = obj.topic;
+    if (obj.start_time) m.at = obj.start_time;
+    if (obj.timezone) m.timezone = obj.timezone;
+    if (hostDisplayName) {
+      m.zoom_host = hostDisplayName;
+      if (!m.assignee || m.assignee === "Unassigned") m.assignee = hostDisplayName;
+    }
+    if (eventType === "meeting.ended") {
+      m.zoom_status = "ended";
+      m.meeting_ended_at = obj.end_time || now;
+      if (typeof obj.duration === "number") m.meeting_duration_seconds = obj.duration * 60;
+    } else if (m.zoom_status !== "ended") {
+      m.zoom_status = "started";
+    }
+    return true;
+  });
 }
 __name(reconcileMeetingLifecycle, "reconcileMeetingLifecycle");
 
 async function reconcileMeetingSummary(env, orgId, obj) {
-  const zoomMeetingId = String(obj.meeting_id || obj.id || obj.uuid || "");
+  const zoomUuid = obj.meeting_uuid || obj.uuid || null;
+  const zoomMeetingId = String(obj.meeting_id || obj.id || zoomUuid || "");
   if (!zoomMeetingId) return;
-  const summaryText = obj.summary_overview || (Array.isArray(obj.summary_details) ? JSON.stringify(obj.summary_details) : null);
-  if (!summaryText) return;
+  const overview = obj.summary_overview || obj.summary_title || null;
+  const normalizeItems = function(arr) {
+    return (Array.isArray(arr) ? arr : []).map(function(x) {
+      if (typeof x === "string") return x;
+      if (x && typeof x === "object") return x.summary || x.label || x.content || JSON.stringify(x);
+      return String(x);
+    }).filter(Boolean);
+  };
+  const details = normalizeItems(obj.summary_details);
+  const steps = normalizeItems(obj.next_steps);
+  const fullText = obj.summary_content || (details.length ? details.join("\n\n") : null);
+  if (!overview && !details.length && !fullText) return;
+  const now = isoNow();
+
   await env.DB.prepare(
     "UPDATE zoom_meetings SET summary = ?, summary_status = 'available', updated_at = ? WHERE zoom_meeting_id = ?"
-  ).bind(summaryText, isoNow(), zoomMeetingId).run();
+  ).bind(overview || fullText || JSON.stringify(details), now, zoomMeetingId).run();
+
+  await mutateOrgSnapshot(env, orgId, function(data) {
+    let m = data.meetings.find(function(x) {
+      return (zoomUuid && x.zoom_uuid === zoomUuid) || (!zoomUuid && !x.zoom_uuid && x.zoom_meeting_id === zoomMeetingId);
+    });
+    if (!m) {
+      // A summary can in principle arrive without a lifecycle event we
+      // captured first -- still record it rather than silently dropping a
+      // real Zoom AI Companion summary. Never fabricate anything beyond
+      // what this event itself tells us.
+      m = {
+        id: genId("meet"),
+        at: now,
+        kind: null,
+        zoom_topic: null,
+        zoom_meeting_id: zoomMeetingId,
+        zoom_uuid: zoomUuid,
+        zoom_host: null,
+        zoom_status: "ended",
+        assignee: "Unassigned",
+        attendees: [],
+        matched_contact_id: null,
+        contact_id: null,
+        matched_deal_id: null,
+        match_state: "unmatched",
+        summary_status: "none",
+        summary_source: null,
+        timezone: null,
+        meeting_duration_seconds: null,
+        meeting_ended_at: null,
+        archived_at: null,
+        created_via: "zoom_webhook"
+      };
+      data.meetings.push(m);
+    }
+    m.summary_status = "available";
+    m.summary_source = "zoom_ai_companion";
+    if (overview) m.summary_overview = overview;
+    if (fullText) m.summary_text = fullText;
+    if (details.length) m.summary_details = details;
+    if (steps.length) m.summary_next_steps = steps;
+    m.summary_created_at = now;
+    return true;
+  });
 }
 __name(reconcileMeetingSummary, "reconcileMeetingSummary");
 
