@@ -1001,16 +1001,28 @@ async function reconcileVoicemailReceived(env, orgId, obj) {
 }
 __name(reconcileVoicemailReceived, "reconcileVoicemailReceived");
 
-async function mutateOrgSnapshot(env, orgId, mutatorFn) {
-  // Server-side, best-effort read-modify-write of the org's single crm_snapshot
-  // JSON blob -- the same store the frontend's GET/PUT /api/db reads and
-  // writes. This is the established pattern other server-side jobs
-  // (automations engine, contract-deadline checks) already use to add
-  // CRM-visible records. A user's own browser PUT can still race this (the
-  // whole blob is last-write-wins), the same accepted trade-off those other
-  // jobs already carry -- not a new risk introduced here.
-  const row = await env.DB.prepare("SELECT data FROM crm_snapshot WHERE org_id = ?").bind(orgId).first();
+async function mutateOrgSnapshot(env, orgId, mutatorFn, attempt) {
+  // Server-side read-modify-write of the org's single crm_snapshot JSON blob
+  // -- the same store the frontend's GET/PUT /api/db reads and writes. A
+  // user's own browser can PUT its own (possibly stale, since it holds
+  // whatever it loaded at page-open time) full copy of the blob at any
+  // moment, which would silently clobber a plain last-write-wins save. To
+  // avoid losing a server-side write to that race, this uses compare-and-
+  // swap on crm_snapshot.updated_at: the write only lands if nobody else
+  // changed the row since we read it; otherwise it re-reads the latest data,
+  // re-applies the (idempotent, find-or-create) mutation, and retries.
+  //
+  // This does NOT protect against the opposite ordering -- a browser tab
+  // that loaded the CRM before this write runs, then saves afterward, will
+  // still overwrite this write with its own stale copy, because it never
+  // knew this record was added. That is a pre-existing trait of the
+  // single-blob/full-copy persistence design (not introduced here) and is
+  // out of scope for this change; real-time server-pushed records remain
+  // most reliable when verified against a session that reloads first.
+  attempt = attempt || 0;
+  const row = await env.DB.prepare("SELECT data, updated_at FROM crm_snapshot WHERE org_id = ?").bind(orgId).first();
   let data = {};
+  let priorUpdatedAt = null;
   if (row && row.data) {
     try {
       data = JSON.parse(row.data);
@@ -1018,16 +1030,31 @@ async function mutateOrgSnapshot(env, orgId, mutatorFn) {
       console.error("crm_snapshot corrupted, skipping server-side meeting sync", e.message);
       return;
     }
+    priorUpdatedAt = row.updated_at;
   }
   if (!Array.isArray(data.meetings)) data.meetings = [];
   const changed = mutatorFn(data);
   if (!changed) return;
   const now = isoNow();
-  await env.DB.prepare(
-    `INSERT INTO crm_snapshot (org_id, data, updated_at, updated_by)
-     VALUES (?, ?, ?, ?)
-     ON CONFLICT(org_id) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at, updated_by = excluded.updated_by`
-  ).bind(orgId, JSON.stringify(data), now, "system:zoom").run();
+  const payload = JSON.stringify(data);
+  let result;
+  if (priorUpdatedAt === null) {
+    result = await env.DB.prepare(
+      "INSERT INTO crm_snapshot (org_id, data, updated_at, updated_by) VALUES (?, ?, ?, ?) ON CONFLICT(org_id) DO NOTHING"
+    ).bind(orgId, payload, now, "system:zoom").run();
+  } else {
+    result = await env.DB.prepare(
+      "UPDATE crm_snapshot SET data = ?, updated_at = ?, updated_by = ? WHERE org_id = ? AND updated_at = ?"
+    ).bind(payload, now, "system:zoom", orgId, priorUpdatedAt).run();
+  }
+  const landed = !!(result && result.meta && result.meta.changes);
+  if (landed) return;
+  if (attempt >= 6) {
+    console.error("mutateOrgSnapshot: gave up after concurrent-write retries", orgId);
+    return;
+  }
+  await new Promise(function(resolve) { setTimeout(resolve, 40 + attempt * 80); });
+  return mutateOrgSnapshot(env, orgId, mutatorFn, attempt + 1);
 }
 __name(mutateOrgSnapshot, "mutateOrgSnapshot");
 
