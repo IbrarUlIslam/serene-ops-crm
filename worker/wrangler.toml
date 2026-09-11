@@ -27,7 +27,7 @@ bucket_name = "serene-ops-crm-files"
 
 [vars]
 # Plain-text (non-secret) vars, values match the live Worker exactly.
-ACCESS_AUD = "b63e75f3dcca3b6e6932f03bd32164d4b0f7a26ca39a1c69ffbe9c295c0c9312,a5a881ef401a82bf21bef53f789d9cacb09dcb9723546ab523accb2ac34d9bf8"
+ACCESS_AUD = "b63e75f3dcca3b6e6932f03bd32164d4b0f7a26ca39a1c69ffbe9c295c0c9312,a5a881ef401a82bf21bef53f789d9cacb09dcb9723546ab523accb2ac34d9bf8,abf4f8cc9a897449896bbd40420dcd5428d1517350c05e776cb50f4135db6677"
 ACCESS_TEAM_DOMAIN = "lucky-mouse-83d8.cloudflareaccess.com"
 
 # Secrets (NAMES ONLY — set with `wrangler secret put <NAME>`, never committed):
@@ -73,19 +73,16 @@ pattern = "staging-crm.sereneop.com/*"
 zone_name = "sereneop.com"
 
 # ---------------------------------------------------------------------------
-# Staging hostname: Cloudflare Access application (STATUS: pending, 2026-09-10)
+# Staging hostname: Cloudflare Access application (STATUS: live, 2026-09-11)
 # ---------------------------------------------------------------------------
-# staging-crm.sereneop.com MUST be protected by a Cloudflare Zero Trust Access
-# application before real use, mirroring the existing crm.sereneop.com app's
-# policy (same authorized CRM user group -- no Everyone/bypass rule). Access
-# applications are not managed by wrangler/this file, and the account's
-# current wrangler OAuth token has no Zero Trust Access scope (confirmed via
-# a live API check: GET .../access/organizations and .../access/groups both
-# returned 403 Authentication error). Until a separately scoped Cloudflare
-# API token with Access (Apps and Policies) read+edit is available, this
-# hostname is NOT Access-protected -- the Worker itself still requires a
-# valid Cf-Access-Jwt-Assertion header for every /api/* call (see
-# verifyAccessJwt in worker.js), so unauthenticated requests are rejected,
-# but nobody can actually obtain that header on this hostname yet because
-# Access is not intercepting it. Do not treat the route above as "live" for
-# real use until the Access application exists.
+# staging-crm.sereneop.com is now protected by its own standalone Cloudflare
+# Zero Trust Access application (created via the dashboard -- Access apps
+# are not managed by wrangler/this file, and the account's wrangler OAuth
+# token has no Zero Trust Access API scope), with the same "Approved Serene
+# Ops users" reusable policy already used by the production crm.sereneop.com
+# app. Its AUD (abf4f8cc9a897449896bbd40420dcd5428d1517350c05e776cb50f4135db6677)
+# is included in ACCESS_AUD above so verifyAccessJwt (worker.js) accepts its
+# JWTs. History: an earlier attempt accidentally edited the EXISTING
+# production "Serene Ops CRM" app's hostname from crm to staging-crm instead
+# of creating a new app (confirmed by AUD collision) -- this was reverted,
+# and staging-crm.sereneop.com now has a genuinely separate application.
