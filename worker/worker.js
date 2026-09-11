@@ -2281,15 +2281,41 @@ __name(handleZohoAttachmentUpload, "handleZohoAttachmentUpload");
 // untouched) and never touches /api/*, /zoom/webhook or /zoho/oauth/callback,
 // which are already routed above this call.
 var STAGING_FRONTEND_ORIGIN = "https://zoom-zoho-integration.serene-ops-crm.pages.dev";
-async function proxyStagingFrontend(request, url) {
+// The pages.dev branch preview above is itself protected by its own
+// Cloudflare Access application ("Serene Ops CRM (pages.dev)"). A plain
+// server-side fetch carries no browser session, so without authenticating
+// this request Access would hand back a 302 to ITS OWN login -- which, if
+// passed through to the real browser, sends it into a second/third Access
+// context it can't cleanly resolve (this is exactly what produced the
+// "Invalid login session" error seen on staging-crm.sereneop.com). Fixed by
+// authenticating this specific outbound fetch with a Cloudflare Access
+// Service Token (see worker/README.md for how it's provisioned) scoped only
+// to that pages.dev app's Service Auth policy -- unrelated to, and never
+// mixed with, the production CRM Access app or its ACCESS_AUD list.
+async function proxyStagingFrontend(request, url, env) {
   const target = STAGING_FRONTEND_ORIGIN + url.pathname + url.search;
+  const headers = new Headers(request.headers);
+  if (env && env.STAGING_PAGES_ACCESS_CLIENT_ID && env.STAGING_PAGES_ACCESS_CLIENT_SECRET) {
+    headers.set("CF-Access-Client-Id", env.STAGING_PAGES_ACCESS_CLIENT_ID);
+    headers.set("CF-Access-Client-Secret", env.STAGING_PAGES_ACCESS_CLIENT_SECRET);
+  }
   try {
     const upstreamResp = await fetch(target, {
       method: request.method,
-      headers: request.headers,
+      headers,
       body: ["GET", "HEAD"].includes(request.method) ? void 0 : request.body,
       redirect: "manual"
     });
+    // A 3xx/401/403 here means the Service Token isn't authorizing this
+    // fetch against the pages.dev Access app (missing/wrong secrets, or the
+    // Service Auth policy isn't attached yet) -- never forward an Access
+    // login redirect to the real browser, that is the exact bug being fixed.
+    if (upstreamResp.status >= 300 && upstreamResp.status < 400 || upstreamResp.status === 401 || upstreamResp.status === 403) {
+      return errorResponse(
+        "Staging proxy misconfigured: the Worker's request to the staging frontend was rejected by Cloudflare Access (status " + upstreamResp.status + "). The STAGING_PAGES_ACCESS_CLIENT_ID / STAGING_PAGES_ACCESS_CLIENT_SECRET Worker secrets are missing, wrong, or not yet authorized by the pages.dev app's Service Auth policy. See worker/README.md.",
+        502
+      );
+    }
     return upstreamResp;
   } catch (err) {
     return errorResponse("Staging frontend proxy failed: " + err.message, 502);
@@ -2312,7 +2338,7 @@ var worker_default = { async fetch(e, r, t) {
   // production frontend is untouched -- it still comes from the Pages
   // custom domain, not this Worker).
   if (_stagingUrl.hostname === "staging-crm.sereneop.com" && !s.startsWith("/api/") && !s.startsWith("/cdn-cgi/")) {
-    return proxyStagingFrontend(e, _stagingUrl);
+    return proxyStagingFrontend(e, _stagingUrl, r);
   }
   if (!s.startsWith("/api/")) return errorResponse("Not found", 404);
   const o = await verifyAccessJwt(e, r);

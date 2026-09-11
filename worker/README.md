@@ -103,3 +103,67 @@ request from the staging (and any future non-`crm.sereneop.com`)
 frontend to the CRM API will start failing CORS preflight again. The
 Worker's own `ALLOWED_ORIGINS` allowlist is the actual security
 boundary and does not need to change when this setting is touched.
+
+
+## Staging same-origin hostname: staging-crm.sereneop.com (2026-09-11)
+
+`staging-crm.sereneop.com` is a dedicated same-origin staging hostname on
+this same Worker, added so authenticated live regression of the
+`zoom-zoho-integration` Pages branch does not hit the cross-site
+Cloudflare Access + CORS problem a `*.pages.dev` preview origin has when
+calling `crm.sereneop.com/api/*` directly. It has its own DNS record
+(proxied CNAME to `serene-ops-crm.pages.dev`, mirroring `crm.sereneop.com`'s
+record) and its own, separate Cloudflare Access application (same
+"Approved Serene Ops users" reusable policy as production; a distinct AUD,
+added to `ACCESS_AUD` in `wrangler.toml`).
+
+On this hostname the Worker (see `proxyStagingFrontend` in `worker.js`)
+handles every request itself: `/api/*` goes through the exact same handlers
+as production, and everything else is proxied server-side to the current
+`zoom-zoho-integration` Pages branch deployment
+(`zoom-zoho-integration.serene-ops-crm.pages.dev`).
+
+### Required Worker secrets: STAGING_PAGES_ACCESS_CLIENT_ID / STAGING_PAGES_ACCESS_CLIENT_SECRET
+
+The `zoom-zoho-integration.serene-ops-crm.pages.dev` branch preview is
+itself protected by its own separate Cloudflare Access application
+("Serene Ops CRM (pages.dev)"). The Worker's server-side proxy fetch to
+that origin carries no browser session/cookies, so without authenticating
+that specific request, Access hands back a login redirect for its own app
+instead of the real page -- which, if passed through to the real browser,
+sends it into a second Access context it cannot cleanly resolve (this is
+what produced an "Invalid login session" error during setup).
+
+The fix: the Worker authenticates that one internal fetch using a
+Cloudflare Access **Service Token**, sent as the `CF-Access-Client-Id` /
+`CF-Access-Client-Secret` headers. This is entirely separate from, and
+never mixed with, the production CRM Access app, its AUD list, or the
+end-user login flow -- it only lets this Worker's own outbound request
+through the *pages.dev preview's* Access gate; end users still log into
+`staging-crm.sereneop.com` normally via the real "Approved Serene Ops
+users" policy.
+
+Provisioning (done once, by a human, in the Cloudflare dashboard and
+terminal -- never via chat/AI, since the secret values must never pass
+through any AI-visible channel):
+
+1. Zero Trust -> Access -> Service Auth -> **Create Service Token**, named
+   e.g. `Serene Ops CRM Staging Proxy`.
+2. Add that Service Token to the **Service Auth policy** on the
+   `zoom-zoho-integration.serene-ops-crm.pages.dev` Access application
+   ("Serene Ops CRM (pages.dev)"), so requests carrying its Client
+   ID/Secret bypass the interactive login for that app specifically.
+3. Set the two Worker secrets directly (values are generated once by
+   Cloudflare and shown only at Service Token creation time -- copy them
+   straight into these commands, never paste them anywhere else):
+   ```
+   wrangler secret put STAGING_PAGES_ACCESS_CLIENT_ID
+   wrangler secret put STAGING_PAGES_ACCESS_CLIENT_SECRET
+   ```
+
+If these secrets are missing, wrong, or the Service Auth policy isn't
+attached yet, the Worker's proxy detects the resulting 3xx/401/403 from
+the pages.dev origin and returns a clear "Staging proxy misconfigured"
+error to the browser instead of forwarding an Access login redirect
+(which is what caused the original bug) -- so a broken configuration
+fails loudly and safely rather than looping.
