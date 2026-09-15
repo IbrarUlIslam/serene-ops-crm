@@ -2338,23 +2338,19 @@ async function proxyStagingFrontend(request, url, env) {
     // the next page/asset load. This proxy only ever serves static frontend
     // assets, which have no legitimate reason to set cookies on the real
     // browser, so Set-Cookie is stripped unconditionally.
-    const safeHeaders = new Headers(upstreamResp.headers);
-    safeHeaders.delete("Set-Cookie");
-    // fetch() always exposes the DECODED body regardless of what
-    // Content-Encoding the upstream declared, but the Content-Encoding /
-    // Content-Length headers on upstreamResp still describe the original
-    // (encoded) bytes. Forwarding those stale headers alongside the already
-    // decoded body tells the browser to decode plaintext as if it were
-    // zstd/gzip -- which hangs or corrupts the response. Strip them and let
-    // Cloudflare's own edge re-encode for the client based on its Accept-
-    // Encoding, same as it would for any other Worker-originated response.
-    safeHeaders.delete("Content-Encoding");
-    safeHeaders.delete("Content-Length");
-    return new Response(upstreamResp.body, {
-      status: upstreamResp.status,
-      statusText: upstreamResp.statusText,
-      headers: safeHeaders
-    });
+    // Delete the header in place rather than reconstructing a new Response
+    // around upstreamResp.body: wrapping the same body stream in a fresh
+    // Response (with a manually rebuilt Headers object) was observed to
+    // intermittently hang the client mid-stream on this large (2MB+) HTML
+    // payload -- some loads completed, others never delivered a single
+    // byte, with no error on either side. Mutating upstreamResp.headers
+    // directly and returning upstreamResp unchanged keeps the Workers
+    // runtime's original single-pass streaming/encoding bookkeeping intact
+    // (the same object that already worked reliably for this proxy before
+    // this fix) while still preventing the pages.dev Access app's
+    // Set-Cookie from ever reaching the real browser.
+    upstreamResp.headers.delete("Set-Cookie");
+    return upstreamResp;
   } catch (err) {
     return errorResponse("Staging frontend proxy failed: " + err.message, 502);
   }
