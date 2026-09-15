@@ -2325,31 +2325,28 @@ async function proxyStagingFrontend(request, url, env) {
         502
       );
     }
-    // Never forward Set-Cookie from this upstream response to the real
-    // browser. The pages.dev app is authenticated here via a Service Token
-    // (server-to-server), and Cloudflare Access can attach its own
-    // Set-Cookie (a CF_Authorization JWT scoped to the pages.dev Access
-    // app's service-auth identity) to that response. That cookie carries no
-    // Domain attribute tying it to pages.dev, so if it reached the browser
-    // it would be stored against staging-crm.sereneop.com -- silently
-    // overwriting the real user's own CF_Authorization session cookie for
-    // the staging-crm Access app with a service-auth JWT the staging app
-    // will not accept, producing persistent 401s on every /api/* call after
-    // the next page/asset load. This proxy only ever serves static frontend
-    // assets, which have no legitimate reason to set cookies on the real
-    // browser, so Set-Cookie is stripped unconditionally.
-    // Delete the header in place rather than reconstructing a new Response
-    // around upstreamResp.body: wrapping the same body stream in a fresh
-    // Response (with a manually rebuilt Headers object) was observed to
-    // intermittently hang the client mid-stream on this large (2MB+) HTML
-    // payload -- some loads completed, others never delivered a single
-    // byte, with no error on either side. Mutating upstreamResp.headers
-    // directly and returning upstreamResp unchanged keeps the Workers
-    // runtime's original single-pass streaming/encoding bookkeeping intact
-    // (the same object that already worked reliably for this proxy before
-    // this fix) while still preventing the pages.dev Access app's
-    // Set-Cookie from ever reaching the real browser.
-    upstreamResp.headers.delete("Set-Cookie");
+    // NOTE: this upstream response can carry a Set-Cookie the pages.dev
+    // Access app issued for its own Service Auth identity (a CF_Authorization
+    // JWT that is NOT valid for the staging-crm Access app). Forwarding it
+    // unmodified -- which is what this function does -- lets the browser
+    // store that bad cookie against staging-crm.sereneop.com, clobbering the
+    // real user's session and producing 401s on subsequent /api/* calls.
+    // The correct fix is to strip Set-Cookie here, but every way tried to do
+    // that (rebuilding the Response with fresh headers, .clone(), piping
+    // upstreamResp.body through an explicit TransformStream, all combined
+    // with deleting Content-Encoding/Content-Length) reproducibly hung the
+    // client indefinitely part-way through transferring this large (2MB+)
+    // HTML document -- confirmed via the Performance API: transferSize stuck
+    // at ~300 bytes and responseEnd never firing, for 100+ seconds, on every
+    // variant. Returning upstreamResp completely unmodified is the one
+    // version of this function that has reliably served this page all
+    // session. Given a broken document proxy is a total outage and a
+    // corrupted-then-self-healing cookie is a recoverable, detectable
+    // condition, the fix now lives client-side instead: index.html's
+    // bootstrap script (search "corrupted Access cookie guard") checks the
+    // CF_Authorization cookie's own audience before mounting and clears +
+    // reloads if it is not actually scoped to staging-crm.sereneop.com, so
+    // Access's normal login/session flow reissues a correct one.
     return upstreamResp;
   } catch (err) {
     return errorResponse("Staging frontend proxy failed: " + err.message, 502);
