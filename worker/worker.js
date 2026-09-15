@@ -2295,6 +2295,15 @@ var STAGING_FRONTEND_ORIGIN = "https://zoom-zoho-integration.serene-ops-crm.page
 async function proxyStagingFrontend(request, url, env) {
   const target = STAGING_FRONTEND_ORIGIN + url.pathname + url.search;
   const headers = new Headers(request.headers);
+  // Strip the browser's own Access session artifacts (its CF_Authorization
+  // cookie and any cf-access-* header) before this server-side fetch. Those
+  // were issued for the staging-crm.sereneop.com Access app, not the
+  // pages.dev Access app being called here -- forwarding them let Access see
+  // a mismatched/invalid identity assertion and reject the request before it
+  // ever got to evaluate the Service Auth policy below. Only the service
+  // token headers we set ourselves should authenticate this fetch.
+  headers.delete("Cookie");
+  headers.delete("cf-access-jwt-assertion");
   if (env && env.STAGING_PAGES_ACCESS_CLIENT_ID && env.STAGING_PAGES_ACCESS_CLIENT_SECRET) {
     headers.set("CF-Access-Client-Id", env.STAGING_PAGES_ACCESS_CLIENT_ID);
     headers.set("CF-Access-Client-Secret", env.STAGING_PAGES_ACCESS_CLIENT_SECRET);
