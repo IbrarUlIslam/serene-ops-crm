@@ -364,7 +364,7 @@ __name(handleDbBlobRequest, "handleDbBlobRequest");
 var ALLOWED_ORIGINS = /* @__PURE__ */ new Set(["https://crm.sereneop.com", "https://zoom-zoho-integration.serene-ops-crm.pages.dev"]);
 function corsHeaders(e) {
   const r = e.headers.get("Origin");
-  return r && ALLOWED_ORIGINS.has(r) ? { "Access-Control-Allow-Origin": r, "Access-Control-Allow-Credentials": "true", "Access-Control-Allow-Headers": "Content-Type, Cf-Access-Jwt-Assertion", "Access-Control-Allow-Methods": "GET, POST, PATCH, PUT, DELETE, OPTIONS", Vary: "Origin" } : {};
+  return r && ALLOWED_ORIGINS.has(r) ? { "Access-Control-Allow-Origin": r, "Access-Control-Allow-Credentials": "true", "Access-Control-Allow-Headers": "Content-Type, Cf-Access-Jwt-Assertion, X-Requested-With", "Access-Control-Allow-Methods": "GET, POST, PATCH, PUT, DELETE, OPTIONS", Vary: "Origin" } : {};
 }
 __name(corsHeaders, "corsHeaders");
 function withCors(e, r) {
