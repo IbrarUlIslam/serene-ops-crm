@@ -2325,7 +2325,26 @@ async function proxyStagingFrontend(request, url, env) {
         502
       );
     }
-    return upstreamResp;
+    // Never forward Set-Cookie from this upstream response to the real
+    // browser. The pages.dev app is authenticated here via a Service Token
+    // (server-to-server), and Cloudflare Access can attach its own
+    // Set-Cookie (a CF_Authorization JWT scoped to the pages.dev Access
+    // app's service-auth identity) to that response. That cookie carries no
+    // Domain attribute tying it to pages.dev, so if it reached the browser
+    // it would be stored against staging-crm.sereneop.com -- silently
+    // overwriting the real user's own CF_Authorization session cookie for
+    // the staging-crm Access app with a service-auth JWT the staging app
+    // will not accept, producing persistent 401s on every /api/* call after
+    // the next page/asset load. This proxy only ever serves static frontend
+    // assets, which have no legitimate reason to set cookies on the real
+    // browser, so Set-Cookie is stripped unconditionally.
+    const safeHeaders = new Headers(upstreamResp.headers);
+    safeHeaders.delete("Set-Cookie");
+    return new Response(upstreamResp.body, {
+      status: upstreamResp.status,
+      statusText: upstreamResp.statusText,
+      headers: safeHeaders
+    });
   } catch (err) {
     return errorResponse("Staging frontend proxy failed: " + err.message, 502);
   }
