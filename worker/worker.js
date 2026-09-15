@@ -2325,29 +2325,21 @@ async function proxyStagingFrontend(request, url, env) {
         502
       );
     }
-    // NOTE: this upstream response can carry a Set-Cookie the pages.dev
-    // Access app issued for its own Service Auth identity (a CF_Authorization
-    // JWT that is NOT valid for the staging-crm Access app). Forwarding it
-    // unmodified -- which is what this function does -- lets the browser
-    // store that bad cookie against staging-crm.sereneop.com, clobbering the
-    // real user's session and producing 401s on subsequent /api/* calls.
-    // The correct fix is to strip Set-Cookie here, but every way tried to do
-    // that (rebuilding the Response with fresh headers, .clone(), piping
-    // upstreamResp.body through an explicit TransformStream, all combined
-    // with deleting Content-Encoding/Content-Length) reproducibly hung the
-    // client indefinitely part-way through transferring this large (2MB+)
-    // HTML document -- confirmed via the Performance API: transferSize stuck
-    // at ~300 bytes and responseEnd never firing, for 100+ seconds, on every
-    // variant. Returning upstreamResp completely unmodified is the one
-    // version of this function that has reliably served this page all
-    // session. Given a broken document proxy is a total outage and a
-    // corrupted-then-self-healing cookie is a recoverable, detectable
-    // condition, the fix now lives client-side instead: index.html's
-    // bootstrap script (search "corrupted Access cookie guard") checks the
-    // CF_Authorization cookie's own audience before mounting and clears +
-    // reloads if it is not actually scoped to staging-crm.sereneop.com, so
-    // Access's normal login/session flow reissues a correct one.
-    return upstreamResp;
+    // This upstream response can carry a Set-Cookie the pages.dev Access
+    // app issued for its own Service Auth identity (a CF_Authorization JWT
+    // scoped to that app, not staging-crm.sereneop.com). That cookie must
+    // never reach the real browser: it has no Domain attribute tying it to
+    // pages.dev, so the browser would store it against staging-crm.sereneop.com
+    // and clobber the real user's session, producing 401s on the next
+    // /api/* calls. Standard Workers response-cloning pattern: wrap the same
+    // body stream in a new Response using upstreamResp itself as the init
+    // (copies status/statusText/headers in one step), then drop Set-Cookie
+    // from the copy -- upstreamResp.headers is guarded immutable so it can't
+    // be deleted in place. This does not buffer or re-read the body; the
+    // stream is passed through untouched.
+    const proxied = new Response(upstreamResp.body, upstreamResp);
+    proxied.headers.delete("Set-Cookie");
+    return proxied;
   } catch (err) {
     return errorResponse("Staging frontend proxy failed: " + err.message, 502);
   }
