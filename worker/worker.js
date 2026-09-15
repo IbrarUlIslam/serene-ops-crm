@@ -2340,6 +2340,16 @@ async function proxyStagingFrontend(request, url, env) {
     // browser, so Set-Cookie is stripped unconditionally.
     const safeHeaders = new Headers(upstreamResp.headers);
     safeHeaders.delete("Set-Cookie");
+    // fetch() always exposes the DECODED body regardless of what
+    // Content-Encoding the upstream declared, but the Content-Encoding /
+    // Content-Length headers on upstreamResp still describe the original
+    // (encoded) bytes. Forwarding those stale headers alongside the already
+    // decoded body tells the browser to decode plaintext as if it were
+    // zstd/gzip -- which hangs or corrupts the response. Strip them and let
+    // Cloudflare's own edge re-encode for the client based on its Accept-
+    // Encoding, same as it would for any other Worker-originated response.
+    safeHeaders.delete("Content-Encoding");
+    safeHeaders.delete("Content-Length");
     return new Response(upstreamResp.body, {
       status: upstreamResp.status,
       statusText: upstreamResp.statusText,
