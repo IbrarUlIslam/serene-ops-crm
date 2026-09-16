@@ -848,6 +848,27 @@ async function zoomApiGet(env, path) {
   return { ok: resp.ok, status: resp.status, body };
 }
 __name(zoomApiGet, "zoomApiGet");
+
+// Owner/Admin-only diagnostic: looks up a specific number in today's Zoom
+// Phone account call history via the real Zoom API (never guessed from
+// local state) so an accidental/misdialed number's actual outcome
+// (rejected/invalid, never connected, ringing, or answered/connected) can be
+// confirmed without placing any further call to it.
+async function handleZoomCallHistoryCheck(request, env, user) {
+  if (!user.isOwner) return errorResponse("Forbidden: Owner/Admin only", 403);
+  const url = new URL(request.url);
+  const needle = (url.searchParams.get("number") || "").replace(/\D/g, "");
+  if (!needle) return errorResponse("number query param is required", 400);
+  const today = new Date();
+  const from = new Date(today.getTime() - 24 * 3600 * 1e3).toISOString().slice(0, 10);
+  const to = today.toISOString().slice(0, 10);
+  const resp = await zoomApiGet(env, `/phone/call_history?type=all&from=${from}&to=${to}&page_size=100`);
+  if (!resp.ok) return json({ data: { ok: false, status: resp.status, body: resp.body } }, resp.status);
+  const entries = (resp.body && resp.body.call_logs) || [];
+  const matches = entries.filter(en => String(en.callee_number || "").replace(/\D/g, "").includes(needle) || String(en.caller_number || "").replace(/\D/g, "").includes(needle));
+  return json({ data: { ok: true, matches, totalEntries: entries.length, sample: entries.slice(0, 3), rawTotalRecords: resp.body && resp.body.total_records } });
+}
+__name(handleZoomCallHistoryCheck, "handleZoomCallHistoryCheck");
 // Zoom's meeting.started / meeting.ended / meeting.summary_completed webhook
 // payloads do not always carry payload.object.uuid -- observed live against
 // a real test meeting on 2026-09-10, whose webhook events came back with no
@@ -2558,6 +2579,9 @@ var worker_default = { async fetch(e, r, t) {
   }
   if ("/api/zoom/calls/claim" === s && "POST" === e.method) {
     return withCors(await handleZoomCallClaim(e, r, n), e);
+  }
+  if ("/api/zoom/call-history-check" === s && "GET" === e.method) {
+    return withCors(await handleZoomCallHistoryCheck(e, r, n), e);
   }
   if (s.startsWith("/api/zoom/meetings/") && "PATCH" === e.method) {
     const zoomMeetingId = s.slice("/api/zoom/meetings/".length);
