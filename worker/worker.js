@@ -1114,9 +1114,27 @@ async function reconcilePhoneCallEnded(env, orgId, eventType, obj) {
   // license owner. If no claim exists (e.g. an inbound call, or the license
   // owner calling directly), fall back to whichever side of the call maps to
   // a CRM user via zoom_phone_user_map. Never guessed.
-  const claim = await env.DB.prepare(
+  let claim = await env.DB.prepare(
     "SELECT crm_user_id, crm_user_name, zoom_user_id FROM zoom_call_initiations WHERE zoom_call_id = ?"
   ).bind(callId).first();
+  if (!claim) {
+    // No exact-callId claim (e.g. the call was placed via the zoomphonecall://
+    // URI fallback, which cannot know the real call_id before Zoom places the
+    // call). Fall back to the most recent pending claim recorded against the
+    // dialed destination number for this org, within a short window, and
+    // promote it to the real call_id so any duplicate/retried webhook for
+    // this same call matches it directly and idempotently next time.
+    const destForClaim = direction === "outbound" ? (callee.phone_number || null) : null;
+    if (destForClaim) {
+      const pending = await env.DB.prepare(
+        "SELECT zoom_call_id as pending_id, crm_user_id, crm_user_name, zoom_user_id FROM zoom_call_initiations WHERE org_id = ? AND dest_number = ? AND zoom_call_id LIKE 'pending:%' AND created_at >= datetime('now','-5 minutes') ORDER BY created_at DESC LIMIT 1"
+      ).bind(orgId, destForClaim).first();
+      if (pending) {
+        claim = pending;
+        await env.DB.prepare("UPDATE zoom_call_initiations SET zoom_call_id = ? WHERE zoom_call_id = ?").bind(callId, pending.pending_id).run();
+      }
+    }
+  }
   const byCaller = caller.user_id ? await findCrmUserByZoomUserId(env, orgId, caller.user_id) : null;
   const byCallee = callee.user_id ? await findCrmUserByZoomUserId(env, orgId, callee.user_id) : null;
   const owner = byCaller || byCallee;
@@ -1626,16 +1644,23 @@ async function handleZoomCallClaim(request, env, user) {
   let body;
   try { body = await request.json(); } catch (_) { return errorResponse("Invalid JSON body", 400); }
   const zoomCallId = body && body.zoomCallId;
-  if (!zoomCallId) return errorResponse("zoomCallId is required", 400);
+  const destNumber = body && body.destNumber;
+  if (!zoomCallId && !destNumber) return errorResponse("zoomCallId or destNumber is required", 400);
   const mapping = await findMappedZoomUser(env, user.orgId, user.id);
   if (!mapping) return errorResponse("Forbidden: no active Zoom Phone identity mapped or authorized for this CRM user", 403);
   const now = isoNow();
+  // destNumber-only claims happen pre-dispatch (e.g. before launching the
+  // zoomphonecall:// URI), when the real Zoom call_id does not exist yet.
+  // Use a synthetic pending id so the row can still be inserted, and let
+  // reconcilePhoneCallEnded match it by destination number + recency, then
+  // promote it to the real call_id once the webhook arrives.
+  const claimId = zoomCallId || ("pending:" + destNumber + ":" + Date.now());
   await env.DB.prepare(
-    `INSERT INTO zoom_call_initiations (zoom_call_id, org_id, crm_user_id, crm_user_name, zoom_user_id, authorized_shared_identity, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)
+    `INSERT INTO zoom_call_initiations (zoom_call_id, org_id, crm_user_id, crm_user_name, zoom_user_id, authorized_shared_identity, dest_number, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(zoom_call_id) DO NOTHING`
-  ).bind(zoomCallId, user.orgId, user.id, user.name || user.email || user.id, mapping.zoom_user_id, mapping.authorized_shared_identity ? 1 : 0, now).run();
-  return json({ data: { ok: true } });
+  ).bind(claimId, user.orgId, user.id, user.name || user.email || user.id, mapping.zoom_user_id, mapping.authorized_shared_identity ? 1 : 0, destNumber || null, now).run();
+  return json({ data: { ok: true, claimId } });
 }
 __name(handleZoomCallClaim, "handleZoomCallClaim");
 
