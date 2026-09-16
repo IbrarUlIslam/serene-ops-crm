@@ -1013,8 +1013,13 @@ __name(findMappedZoomUser, "findMappedZoomUser");
 
 async function findCrmUserByZoomUserId(env, orgId, zoomUserId) {
   if (!zoomUserId) return null;
+  // When several CRM users share one licensed Zoom Phone identity
+  // (authorized_shared_identity), prefer the actual license owner here as
+  // the fallback attribution -- the real-time claim recorded in
+  // zoom_call_initiations (see reconcilePhoneCallEnded) is what correctly
+  // attributes a specific call to a specific authorized operator instead.
   return env.DB.prepare(
-    "SELECT crm_user_id, zoom_user_id FROM zoom_phone_user_map WHERE org_id = ? AND zoom_user_id = ? AND active = 1"
+    "SELECT crm_user_id, zoom_user_id, zoom_email, zoom_extension FROM zoom_phone_user_map WHERE org_id = ? AND zoom_user_id = ? AND active = 1 ORDER BY authorized_shared_identity ASC, created_at ASC LIMIT 1"
   ).bind(orgId, zoomUserId).first();
 }
 __name(findCrmUserByZoomUserId, "findCrmUserByZoomUserId");
@@ -1081,16 +1086,29 @@ async function reconcilePhoneCallEnded(env, orgId, eventType, obj) {
   const direction = obj.direction || null;
   const durationSeconds = typeof obj.duration === "number" ? obj.duration : null;
 
-  // Attribution: whichever side of the call is a Zoom user we have mapped to
-  // a CRM user is the "initiated_by" / handled-by identity. If neither side
-  // maps to a CRM user, the call is Unassigned / Needs Attention -- never
-  // guessed. We check the caller first for outbound, callee first for
-  // inbound, but fall back to whichever side actually resolves.
+  // Attribution: first check for a real-time claim recorded by the CRM at
+  // call-start (zoom_call_initiations) -- this is how a call placed by an
+  // authorized operator sharing someone else's licensed Zoom Phone identity
+  // is correctly attributed to the operator who actually placed it, not the
+  // license owner. If no claim exists (e.g. an inbound call, or the license
+  // owner calling directly), fall back to whichever side of the call maps to
+  // a CRM user via zoom_phone_user_map. Never guessed.
+  const claim = await env.DB.prepare(
+    "SELECT crm_user_id, crm_user_name, zoom_user_id FROM zoom_call_initiations WHERE zoom_call_id = ?"
+  ).bind(callId).first();
   const byCaller = caller.user_id ? await findCrmUserByZoomUserId(env, orgId, caller.user_id) : null;
   const byCallee = callee.user_id ? await findCrmUserByZoomUserId(env, orgId, callee.user_id) : null;
   const owner = byCaller || byCallee;
-  const initiatedBy = owner ? owner.crm_user_id : null;
-  const attribution = owner ? "assigned" : "unassigned";
+  const initiatedBy = claim ? claim.crm_user_id : (owner ? owner.crm_user_id : null);
+  const attribution = initiatedBy ? "assigned" : "unassigned";
+  const licensedZoomUserId = (claim && claim.zoom_user_id) || (owner && owner.zoom_user_id) || caller.user_id || callee.user_id || null;
+  let zoomPhoneIdentity = null;
+  if (licensedZoomUserId) {
+    const identityRow = await env.DB.prepare(
+      "SELECT zoom_email, zoom_extension FROM zoom_phone_user_map WHERE org_id = ? AND zoom_user_id = ? ORDER BY authorized_shared_identity ASC, created_at ASC LIMIT 1"
+    ).bind(orgId, licensedZoomUserId).first();
+    zoomPhoneIdentity = identityRow ? (identityRow.zoom_email || identityRow.zoom_extension || licensedZoomUserId) : licensedZoomUserId;
+  }
 
   const externalNumber = direction === "outbound" ? (callee.phone_number || null) : (caller.phone_number || null);
   const contactId = await matchContactByPhone(env, orgId, externalNumber);
@@ -1106,15 +1124,16 @@ async function reconcilePhoneCallEnded(env, orgId, eventType, obj) {
       `UPDATE zoom_calls SET direction = COALESCE(?, direction), from_number = COALESCE(?, from_number),
         to_number = COALESCE(?, to_number), status = 'ended', duration_seconds = COALESCE(?, duration_seconds),
         initiated_by = COALESCE(initiated_by, ?), attribution = CASE WHEN initiated_by IS NULL AND ? IS NOT NULL THEN 'assigned' ELSE attribution END,
+        zoom_phone_identity = COALESCE(zoom_phone_identity, ?),
         contact_id = COALESCE(contact_id, ?), match_status = CASE WHEN contact_id IS NULL AND ? IS NOT NULL THEN 'matched' ELSE match_status END,
         updated_at = ? WHERE id = ?`
-    ).bind(direction, caller.phone_number || null, callee.phone_number || null, durationSeconds, initiatedBy, initiatedBy, contactId, contactId, now, existing.id).run();
+    ).bind(direction, caller.phone_number || null, callee.phone_number || null, durationSeconds, initiatedBy, initiatedBy, zoomPhoneIdentity, contactId, contactId, now, existing.id).run();
     return;
   }
   await env.DB.prepare(
-    `INSERT INTO zoom_calls (id, org_id, call_id, zoom_call_id, zoom_event_id, direction, from_number, to_number, status, duration_seconds, initiated_by, attribution, contact_id, match_status, created_at, updated_at)
-     VALUES (?, ?, NULL, ?, ?, ?, ?, ?, 'ended', ?, ?, ?, ?, ?, ?, ?)`
-  ).bind(genId("zc"), orgId, callId, eventType, direction, caller.phone_number || null, callee.phone_number || null, durationSeconds, initiatedBy, attribution, contactId, contactId ? "matched" : "unmatched", now, now).run();
+    `INSERT INTO zoom_calls (id, org_id, call_id, zoom_call_id, zoom_event_id, direction, from_number, to_number, status, duration_seconds, initiated_by, attribution, zoom_phone_identity, contact_id, match_status, created_at, updated_at)
+     VALUES (?, ?, NULL, ?, ?, ?, ?, ?, 'ended', ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).bind(genId("zc"), orgId, callId, eventType, direction, caller.phone_number || null, callee.phone_number || null, durationSeconds, initiatedBy, attribution, zoomPhoneIdentity, contactId, contactId ? "matched" : "unmatched", now, now).run();
 }
 __name(reconcilePhoneCallEnded, "reconcilePhoneCallEnded");
 
@@ -1502,14 +1521,32 @@ async function handleZoomPhoneMapping(request, env, user) {
     if (!crmUserId || !zoomUserId) return errorResponse("crmUserId and zoomUserId are required", 400);
     const target = await env.DB.prepare("SELECT id FROM users WHERE id = ? AND org_id = ? AND deleted_at IS NULL").bind(crmUserId, user.orgId).first();
     if (!target) return errorResponse("CRM user not found", 404);
+    // If this Zoom identity is already the actual license (an existing
+    // active row for a DIFFERENT crm_user_id with authorized_shared_identity
+    // = 0), this new mapping is an authorized SHARED use of someone else's
+    // license, not a reassignment of it. Require the admin to explicitly say
+    // so (authorizedSharedIdentity: true) rather than silently allowing it --
+    // this keeps the data model truthful: the license owner row is never
+    // overwritten or faked as belonging to the new CRM user.
+    const licenseOwnerRow = await env.DB.prepare(
+      "SELECT crm_user_id FROM zoom_phone_user_map WHERE org_id = ? AND zoom_user_id = ? AND active = 1 AND authorized_shared_identity = 0 AND crm_user_id != ?"
+    ).bind(user.orgId, zoomUserId, crmUserId).first();
+    if (licenseOwnerRow && !(body && body.authorizedSharedIdentity === true)) {
+      return errorResponse("This Zoom Phone identity is already licensed to a different CRM user. Resubmit with authorizedSharedIdentity: true to explicitly grant " + crmUserId + " authorized shared use of that same identity (their own license ownership is not created or changed).", 409);
+    }
+    const isShared = !!licenseOwnerRow;
     const now = isoNow();
     await env.DB.prepare(
-      `INSERT INTO zoom_phone_user_map (id, org_id, crm_user_id, zoom_user_id, zoom_extension, zoom_email, active, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
-       ON CONFLICT(org_id, crm_user_id) DO UPDATE SET zoom_user_id = excluded.zoom_user_id, zoom_extension = excluded.zoom_extension, zoom_email = excluded.zoom_email, active = 1, updated_at = excluded.updated_at`
-    ).bind(genId("zpm"), user.orgId, crmUserId, zoomUserId, body.zoomExtension || null, body.zoomEmail || null, now, now).run();
-    await logActivity(env, user, "map-zoom-phone-identity", "zoom_phone_user_map", crmUserId, null);
-    return json({ data: { ok: true } });
+      `INSERT INTO zoom_phone_user_map (id, org_id, crm_user_id, zoom_user_id, zoom_extension, zoom_email, active, authorized_shared_identity, licensed_owner_crm_user_id, authorized_by, authorized_at, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(org_id, crm_user_id) DO UPDATE SET zoom_user_id = excluded.zoom_user_id, zoom_extension = excluded.zoom_extension, zoom_email = excluded.zoom_email, active = 1,
+         authorized_shared_identity = excluded.authorized_shared_identity, licensed_owner_crm_user_id = excluded.licensed_owner_crm_user_id,
+         authorized_by = excluded.authorized_by, authorized_at = excluded.authorized_at, updated_at = excluded.updated_at`
+    ).bind(genId("zpm"), user.orgId, crmUserId, zoomUserId, body.zoomExtension || null, body.zoomEmail || null,
+      isShared ? 1 : 0, isShared ? licenseOwnerRow.crm_user_id : null, isShared ? (user.name || user.email || user.id) : null, isShared ? now : null,
+      now, now).run();
+    await logActivity(env, user, isShared ? "authorize-shared-zoom-phone-identity" : "map-zoom-phone-identity", "zoom_phone_user_map", crmUserId, null);
+    return json({ data: { ok: true, authorizedSharedIdentity: isShared } });
   }
   return errorResponse("Method not allowed", 405);
 }
@@ -1526,18 +1563,60 @@ async function handleZoomCallsList(request, env, user) {
   const limit = Math.min(200, Math.max(1, parseInt(url.searchParams.get("limit") || "100", 10) || 100));
   const calls = await env.DB.prepare(
     `SELECT id, call_id, zoom_call_id, direction, from_number, to_number, status,
-            duration_seconds, initiated_by, attribution, contact_id, match_status,
+            duration_seconds, initiated_by, attribution, zoom_phone_identity, contact_id, match_status,
             created_at, updated_at
      FROM zoom_calls WHERE org_id = ? ORDER BY updated_at DESC LIMIT ?`
   ).bind(user.orgId, limit).all();
+  const rows = (calls && calls.results) || [];
+  // initiated_by stores the CRM user's id (never fabricated); resolve it to a
+  // display name here so the frontend can show the actual human operator
+  // clearly, distinct from zoom_phone_identity (the licensed Zoom email/
+  // extension that technically placed the call on Zoom's side).
+  const initiatorIds = Array.from(new Set(rows.map(rrow => rrow.initiated_by).filter(Boolean)));
+  let namesById = {};
+  if (initiatorIds.length) {
+    const placeholders = initiatorIds.map(() => "?").join(",");
+    const users = await env.DB.prepare(
+      `SELECT id, name FROM users WHERE org_id = ? AND id IN (${placeholders})`
+    ).bind(user.orgId, ...initiatorIds).all();
+    ((users && users.results) || []).forEach(u2 => { namesById[u2.id] = u2.name; });
+  }
+  const callsOut = rows.map(rrow => Object.assign({}, rrow, {
+    initiated_by_name: rrow.initiated_by ? (namesById[rrow.initiated_by] || null) : null
+  }));
   const voicemails = await env.DB.prepare(
     `SELECT id, zoom_call_row_id, contact_id, from_number, duration_seconds,
             transcript, status, created_at
      FROM zoom_voicemails WHERE org_id = ? ORDER BY created_at DESC LIMIT ?`
   ).bind(user.orgId, limit).all();
-  return json({ data: { calls: (calls && calls.results) || [], voicemails: (voicemails && voicemails.results) || [] } });
+  return json({ data: { calls: callsOut, voicemails: (voicemails && voicemails.results) || [] } });
 }
 __name(handleZoomCallsList, "handleZoomCallsList");
+
+// Records, at the moment a Smart Embed call actually starts ringing/connects
+// (the first point a Zoom call_id is known client-side), which authenticated
+// CRM user placed it -- so the async completion webhook can attribute the
+// call correctly even when several CRM users share one licensed Zoom Phone
+// identity. The caller must have an active mapping (their own license, or an
+// explicitly authorized shared identity) for the claim to be accepted; this
+// prevents an unmapped user from spoofing attribution for a call they did
+// not have a real Zoom Phone identity to place.
+async function handleZoomCallClaim(request, env, user) {
+  let body;
+  try { body = await request.json(); } catch (_) { return errorResponse("Invalid JSON body", 400); }
+  const zoomCallId = body && body.zoomCallId;
+  if (!zoomCallId) return errorResponse("zoomCallId is required", 400);
+  const mapping = await findMappedZoomUser(env, user.orgId, user.id);
+  if (!mapping) return errorResponse("Forbidden: no active Zoom Phone identity mapped or authorized for this CRM user", 403);
+  const now = isoNow();
+  await env.DB.prepare(
+    `INSERT INTO zoom_call_initiations (zoom_call_id, org_id, crm_user_id, crm_user_name, zoom_user_id, authorized_shared_identity, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(zoom_call_id) DO NOTHING`
+  ).bind(zoomCallId, user.orgId, user.id, user.name || user.email || user.id, mapping.zoom_user_id, mapping.authorized_shared_identity ? 1 : 0, now).run();
+  return json({ data: { ok: true } });
+}
+__name(handleZoomCallClaim, "handleZoomCallClaim");
 
 async function handleZoomDiagnostics(env) {
   // Access-gated, authenticated-CRM-user-only diagnostic endpoint. Confirms the
@@ -2476,6 +2555,9 @@ var worker_default = { async fetch(e, r, t) {
   }
   if ("/api/zoom/calls" === s && "GET" === e.method) {
     return withCors(await handleZoomCallsList(e, r, n), e);
+  }
+  if ("/api/zoom/calls/claim" === s && "POST" === e.method) {
+    return withCors(await handleZoomCallClaim(e, r, n), e);
   }
   if (s.startsWith("/api/zoom/meetings/") && "PATCH" === e.method) {
     const zoomMeetingId = s.slice("/api/zoom/meetings/".length);
