@@ -1515,6 +1515,30 @@ async function handleZoomPhoneMapping(request, env, user) {
 }
 __name(handleZoomPhoneMapping, "handleZoomPhoneMapping");
 
+// Serves the server-side reconciled Zoom Phone call/voicemail records (the
+// zoom_calls / zoom_voicemails tables populated by reconcileZoomEvent from
+// real Zoom webhooks) to the CRM frontend, so completed calls -- including
+// inbound calls no CRM user manually logged from the Dialer's outcome modal
+// -- and voicemails actually surface in the CRM rather than only living in
+// D1. Read-only, org-scoped, capped and ordered newest-first.
+async function handleZoomCallsList(request, env, user) {
+  const url = new URL(request.url);
+  const limit = Math.min(200, Math.max(1, parseInt(url.searchParams.get("limit") || "100", 10) || 100));
+  const calls = await env.DB.prepare(
+    `SELECT id, call_id, zoom_call_id, direction, from_number, to_number, status,
+            duration_seconds, initiated_by, attribution, contact_id, match_status,
+            created_at, updated_at
+     FROM zoom_calls WHERE org_id = ? ORDER BY updated_at DESC LIMIT ?`
+  ).bind(user.orgId, limit).all();
+  const voicemails = await env.DB.prepare(
+    `SELECT id, zoom_call_row_id, contact_id, from_number, duration_seconds,
+            transcript, status, created_at
+     FROM zoom_voicemails WHERE org_id = ? ORDER BY created_at DESC LIMIT ?`
+  ).bind(user.orgId, limit).all();
+  return json({ data: { calls: (calls && calls.results) || [], voicemails: (voicemails && voicemails.results) || [] } });
+}
+__name(handleZoomCallsList, "handleZoomCallsList");
+
 async function handleZoomDiagnostics(env) {
   // Access-gated, authenticated-CRM-user-only diagnostic endpoint. Confirms the
   // S2S OAuth helper works against real, safe, read-only Zoom endpoints. Never
@@ -2449,6 +2473,9 @@ var worker_default = { async fetch(e, r, t) {
   }
   if ("/api/zoom/phone-mapping" === s) {
     return withCors(await handleZoomPhoneMapping(e, r, n), e);
+  }
+  if ("/api/zoom/calls" === s && "GET" === e.method) {
+    return withCors(await handleZoomCallsList(e, r, n), e);
   }
   if (s.startsWith("/api/zoom/meetings/") && "PATCH" === e.method) {
     const zoomMeetingId = s.slice("/api/zoom/meetings/".length);
