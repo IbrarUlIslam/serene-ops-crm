@@ -1,0 +1,88 @@
+name = "serene-ops-crm-api"
+main = "worker.js"
+compatibility_date = "2026-09-04"
+workers_dev = true
+preview_urls = true
+
+[observability]
+enabled = true
+
+[observability.logs]
+enabled = true
+
+# This file documents the EXISTING live configuration of the serene-ops-crm-api
+# Worker, verified against the Cloudflare dashboard on 2026-09-10. It is checked
+# in for reference / disaster recovery. It intentionally does NOT redeploy or
+# alter production on its own (no CI/CD is wired to this file yet) and it must
+# never contain secret VALUES.
+
+[[d1_databases]]
+binding = "DB"
+database_name = "serene-ops-crm-db"
+database_id = "f3d33499-438b-4f73-9024-9c307bb4eee4"
+
+[[r2_buckets]]
+binding = "FILES"
+bucket_name = "serene-ops-crm-files"
+
+[vars]
+# Plain-text (non-secret) vars, values match the live Worker exactly.
+ACCESS_AUD = "b63e75f3dcca3b6e6932f03bd32164d4b0f7a26ca39a1c69ffbe9c295c0c9312,a5a881ef401a82bf21bef53f789d9cacb09dcb9723546ab523accb2ac34d9bf8,abf4f8cc9a897449896bbd40420dcd5428d1517350c05e776cb50f4135db6677"
+ACCESS_TEAM_DOMAIN = "lucky-mouse-83d8.cloudflareaccess.com"
+
+# Secrets (NAMES ONLY — set with `wrangler secret put <NAME>`, never committed):
+#   ZOOM_ACCOUNT_ID
+#   ZOOM_CLIENT_ID
+#   ZOOM_CLIENT_SECRET
+#   ZOOM_WEBHOOK_SECRET_TOKEN
+
+[triggers]
+crons = ["*/15 * * * *", "0 20 * * *"]
+
+[[routes]]
+pattern = "crm.sereneop.com/api/*"
+zone_name = "sereneop.com"
+
+[[routes]]
+pattern = "crm.sereneop.com/zoom/webhook"
+zone_name = "sereneop.com"
+
+[[routes]]
+# Note: an exact-match pattern here (no trailing wildcard) was observed to NOT
+# reliably take precedence over the Pages custom domain for crm.sereneop.com,
+# even though wrangler reported it as registered and the Cloudflare API showed
+# it in the zone's route list. A wildcard pattern does take precedence
+# correctly. Keep this as a wildcard.
+pattern = "crm.sereneop.com/zoho/*"
+zone_name = "sereneop.com"
+
+[[routes]]
+# staging-crm.sereneop.com: a dedicated same-origin staging hostname, added so
+# authenticated live regression of the zoom-zoho-integration Pages branch
+# does not hit the cross-site Cloudflare Access + CORS problem that a
+# *.pages.dev preview origin has when calling crm.sereneop.com/api/*. This
+# hostname has NO separate Pages custom domain -- every request on it (both
+# /api/* and the plain frontend) is handled entirely by this Worker: /api/*
+# goes through the exact same handlers as production, and everything else is
+# proxied server-side to the current zoom-zoho-integration Pages branch
+# deployment (see proxyStagingFrontend in worker.js). Must be paired with a
+# Cloudflare Access application protecting staging-crm.sereneop.com (mirroring
+# the crm.sereneop.com app's policy) before this hostname is used -- see the
+# "Staging hostname" section below.
+pattern = "staging-crm.sereneop.com/*"
+zone_name = "sereneop.com"
+
+# ---------------------------------------------------------------------------
+# Staging hostname: Cloudflare Access application (STATUS: live, 2026-09-11)
+# ---------------------------------------------------------------------------
+# staging-crm.sereneop.com is now protected by its own standalone Cloudflare
+# Zero Trust Access application (created via the dashboard -- Access apps
+# are not managed by wrangler/this file, and the account's wrangler OAuth
+# token has no Zero Trust Access API scope), with the same "Approved Serene
+# Ops users" reusable policy already used by the production crm.sereneop.com
+# app. Its AUD (abf4f8cc9a897449896bbd40420dcd5428d1517350c05e776cb50f4135db6677)
+# is included in ACCESS_AUD above so verifyAccessJwt (worker.js) accepts its
+# JWTs. History: an earlier attempt accidentally edited the EXISTING
+# production "Serene Ops CRM" app's hostname from crm to staging-crm instead
+# of creating a new app (confirmed by AUD collision) -- this was reverted,
+# and staging-crm.sereneop.com now has a genuinely separate application.
