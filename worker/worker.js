@@ -1104,8 +1104,19 @@ async function reconcilePhoneCallEnded(env, orgId, eventType, obj) {
   if (!callId) return;
   const caller = obj.caller || {};
   const callee = obj.callee || {};
-  const direction = obj.direction || null;
-  const durationSeconds = typeof obj.duration === "number" ? obj.duration : null;
+  // Zoom's actual phone.caller_ended / phone.callee_ended webhook payloads do
+  // NOT include a top-level "direction" field (confirmed against a real,
+  // successfully-connected outbound call's payload) -- it must be inferred
+  // from which side is the PSTN party. zoom_calls.direction is NOT NULL, so
+  // leaving this as obj.direction||null silently threw a D1 constraint
+  // violation on every real call and dropped it entirely before it could be
+  // inserted into zoom_calls (no CRM history, no Contact match, no Activity).
+  const direction = obj.direction
+    || (callee.extension_type === "pstn" ? "outbound" : (caller.extension_type === "pstn" ? "inbound" : "unknown"));
+  const durationSeconds = typeof obj.duration === "number" ? obj.duration
+    : (obj.connected_start_time && obj.call_end_time
+        ? Math.max(0, Math.round((new Date(obj.call_end_time).getTime() - new Date(obj.connected_start_time).getTime()) / 1000))
+        : null);
 
   // Attribution: first check for a real-time claim recorded by the CRM at
   // call-start (zoom_call_initiations) -- this is how a call placed by an
@@ -1688,6 +1699,19 @@ async function handleZoomDiagnostics(env) {
   } catch (e) {
     out.phoneUsers = { ok: false, error: e.message };
   }
+  out.phoneNumbersCheck = null;
+  try {
+    const rn = await zoomApiGet(env, "/phone/numbers?page_size=100");
+    const nums = (rn.body && Array.isArray(rn.body.phone_numbers)) ? rn.body.phone_numbers : [];
+    out.phoneNumbersCheck = {
+      status: rn.status, ok: rn.ok, total: nums.length,
+      hasTarget: nums.some(n => String(n.number||"").replace(/\D/g,"").endsWith("3052032712")),
+      sampleNumbers: nums.slice(0,20).map(n => ({ number: n.number, assignee: n.assignee && n.assignee.name, type: n.assignee && n.assignee.type })),
+      rawErrorBody: rn.ok ? null : rn.body
+    };
+  } catch (e) {
+    out.phoneNumbersCheck = { ok: false, error: e.message };
+  }
   try {
     const r2 = await zoomApiGet(env, "/phone/call_logs?page_size=1");
     out.phoneCallLogs = { status: r2.status, ok: r2.ok, count: r2.body && typeof r2.body.total_records === "number" ? r2.body.total_records : null };
@@ -1723,6 +1747,31 @@ async function handleZoomDiagnostics(env) {
     }
   } catch (e) {
     out.meetings = out.meetings || { ok: false, error: e.message };
+  }
+
+  // Temporary debug aid: re-run reconciliation for the most recent
+  // phone.caller_ended/callee_ended webhook event against the current
+  // (possibly just-fixed) code, surfacing the real exception message instead
+  // of only console.error -- used to diagnose why zoom_calls stayed empty
+  // after a real, correctly-received webhook. Idempotent: reconcilePhoneCallEnded
+  // upserts on zoom_call_id, so re-running it is safe and just finishes the
+  // job it should have done the first time.
+  out.replayLastCallEnd = null;
+  try {
+    const lastEvt = await env.DB.prepare(
+      "SELECT event_type, object_json FROM zoom_webhook_events WHERE event_type IN ('phone.caller_ended','phone.callee_ended') ORDER BY received_at DESC LIMIT 1"
+    ).first();
+    if (!lastEvt) {
+      out.replayLastCallEnd = { ok: false, error: "no phone.caller_ended/callee_ended event on record" };
+    } else {
+      const obj = JSON.parse(lastEvt.object_json);
+      const beforeRow = await env.DB.prepare("SELECT id FROM zoom_calls WHERE zoom_call_id = ?").bind(obj.call_id).first();
+      await reconcilePhoneCallEnded(env, "org1", lastEvt.event_type, obj);
+      const afterRow = await env.DB.prepare("SELECT id, direction, contact_id, match_status FROM zoom_calls WHERE zoom_call_id = ?").bind(obj.call_id).first();
+      out.replayLastCallEnd = { ok: true, callId: obj.call_id, existedBefore: !!beforeRow, existsAfter: !!afterRow, row: afterRow || null };
+    }
+  } catch (e) {
+    out.replayLastCallEnd = { ok: false, error: e.message, stack: (e.stack || "").split("\n").slice(0, 5) };
   }
 
   return json(out, 200);
