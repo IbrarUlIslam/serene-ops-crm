@@ -1,0 +1,13 @@
+.wrangler/
+
+# Local credentials, tooling and private working artifacts
+.env
+.env.*
+!.env.example
+.dev.vars
+.dev.vars.*
+node_modules/
+tmp/
+*.log
+/*.png
+/audit-detailed-example.html

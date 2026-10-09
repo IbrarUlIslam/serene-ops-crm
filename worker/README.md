@@ -1,5 +1,7 @@
 # Worker: serene-ops-crm-api
 
+> Current source published October 10, 2026. See the root README for the current module map, testing and deployment guidance. The baseline notes below describe the original September import and are retained as history.
+
 This directory documents the existing, live Cloudflare Worker that powers the
 Serene Ops CRM backend (serene-ops-crm-api), for reference and disaster
 recovery.

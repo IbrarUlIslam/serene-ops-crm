@@ -1,0 +1,20 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import vm from 'node:vm';
+const html=fs.readFileSync(new URL('../index.html',import.meta.url),'utf8');
+const template=JSON.parse(html.match(/<script type="__bundler\/template">([\s\S]*?)<\/script>/)[1]);
+const code=template.match(/<script type="text\/x-dc"[^>]*>([\s\S]*?)<\/script>/)[1];
+for(const profile of ['owner','administrator','sales'])test(`new contact retains editable fields for ${profile}`,()=>{
+ const context={Date,Intl,JSON,Math,URL,URLSearchParams,console,DCLogic:class{}};
+ vm.createContext(context);vm.runInContext(code+';globalThis.C=Component;',context);
+ const c=new context.C();c.state={...c.state,modal:'quickadd',draft:{name:'QA prospect'}};
+ c.isSalesAssociate=()=>profile==='sales';c.timezoneChoices=()=>[];c.draftTimeEquivalents=()=>({});
+ const view=c.modalVals({db:{},live:[],byId:{},clients:[]});
+ assert.equal(view.modalTitle,profile==='sales'?'New sales contact':'New contact');
+ assert.equal(view.modalCta,'Add contact');
+ const labels=Array.from(view.modalFields,f=>f.label);
+ for(const label of ['Name','Brokerage','State','Status','Phone','Email'])assert.ok(labels.includes(label),`${label} is editable`);
+ assert.equal(view.modalFields.find(f=>f.label==='Name').value,'QA prospect');
+ assert.equal(labels.includes('Sales notes'),profile==='sales');
+});

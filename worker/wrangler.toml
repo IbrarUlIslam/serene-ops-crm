@@ -25,7 +25,13 @@ database_id = "f3d33499-438b-4f73-9024-9c307bb4eee4"
 binding = "FILES"
 bucket_name = "serene-ops-crm-files"
 
+[ai]
+binding = "AI"
+
 [vars]
+CRM_LOW_COST_MODE = "true"
+CRM_ACCESS_ACCOUNT_ID = "e00002b4ff2362ef98e796b2ecb121cd"
+CRM_ACCESS_POLICY_ID = "d5a19915-a1d2-446f-8f61-bcc8dfb463dc"
 # Plain-text (non-secret) vars, values match the live Worker exactly.
 ACCESS_AUD = "b63e75f3dcca3b6e6932f03bd32164d4b0f7a26ca39a1c69ffbe9c295c0c9312,a5a881ef401a82bf21bef53f789d9cacb09dcb9723546ab523accb2ac34d9bf8,abf4f8cc9a897449896bbd40420dcd5428d1517350c05e776cb50f4135db6677"
 ACCESS_TEAM_DOMAIN = "lucky-mouse-83d8.cloudflareaccess.com"
@@ -44,7 +50,13 @@ pattern = "crm.sereneop.com/api/*"
 zone_name = "sereneop.com"
 
 [[routes]]
+# Catch subpaths as well: only the exact webhook endpoint is handled by the
+# Worker; other paths return 404 instead of Pages' public HTML fallback.
 pattern = "crm.sereneop.com/zoom/webhook"
+zone_name = "sereneop.com"
+
+[[routes]]
+pattern = "crm.sereneop.com/zoom/webhook/*"
 zone_name = "sereneop.com"
 
 [[routes]]
