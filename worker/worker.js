@@ -1,3 +1,5 @@
+import {runNightlyBackup} from './backups.mjs';
+import {diagnosticMailOrigin} from './provider-safety.mjs';
 import {handleCallHistory} from './call-history.mjs';
 import {handleContactNotes} from './contact-notes.mjs';
 import {senderAddresses,chooseSender} from './mail-senders.mjs';
@@ -71,6 +73,9 @@ async function verifyAccessJwt(e, r) {
     return { ok: false, status: 401, error: "Unable to parse Access JWT" };
   }
   const c = Math.floor(Date.now() / 1e3);
+  if (i.alg !== "RS256" || typeof i.kid !== "string") return { ok: false, status: 401, error: "Unsupported Access signing algorithm" };
+  if (d.iss !== `https://${r.ACCESS_TEAM_DOMAIN}`) return { ok: false, status: 401, error: "Access JWT issuer mismatch" };
+  if (!Number.isFinite(d.exp) || (d.nbf !== undefined && !Number.isFinite(d.nbf))) return { ok: false, status: 401, error: "Access JWT validity claims are invalid" };
   if ("number" == typeof d.exp && c >= d.exp) return { ok: false, status: 401, error: "Access JWT expired" };
   if ("number" == typeof d.nbf && c < d.nbf) return { ok: false, status: 401, error: "Access JWT not yet valid" };
   const u = Array.isArray(d.aud) ? d.aud : [d.aud], l = (r.ACCESS_AUD || "").split(",").map((e2) => e2.trim()).filter(Boolean);
@@ -418,56 +423,6 @@ function withCors(e, r) {
 }
 __name(withCors, "withCors");
 __name2(withCors, "withCors");
-var BACKUP_TABLES = ["crm_daily_usage", "call_reservations", "user_invitations", "user_invitation_locks", "user_visibility", "audit_cases", "audit_reports", "audit_connector_runs", "access_records", "activity_log", "audit_log", "automation_rules", "automation_runs", "business_tasks", "calls", "client_commercial", "client_scope", "client_services", "clients", "compliance_jurisdictions", "compliance_overlays", "compliance_reviews", "compliance_rules", "compliance_sources", "contacts", "crm_snapshot", "deal_stage_history", "deals", "files", "meetings", "notes", "organizations", "permissions", "reminders", "reports", "role_permissions", "roles", "scope_usage", "sessions", "social_accounts", "social_performance", "social_posts", "social_schedule", "sop_approvals", "sop_evidence", "sop_instance_steps", "sop_instances", "sop_sources", "sop_steps", "sop_template_sources", "sop_template_versions", "sop_templates", "ticket_history", "tickets", "users", "work_assignments", "work_history", "work_items", "work_time_logs"];
-var BACKUP_RETENTION_DAYS = 45;
-async function runNightlyBackup(env) {
-  const dump = {};
-  const errors = {};
-  for (const table of BACKUP_TABLES) {
-    try {
-      const result = await env.DB.prepare("SELECT * FROM " + table).all();
-      let rows = result.results || [];
-      if (table === "users") {
-        rows = rows.map(function(r) {
-          const copy = Object.assign({}, r);
-          delete copy.password_hash;
-          return copy;
-        });
-      }
-      dump[table] = rows;
-    } catch (e) {
-      errors[table] = e.message;
-    }
-  }
-  const timestamp = (/* @__PURE__ */ new Date()).toISOString();
-  const payload = { backedUpAt: timestamp, tableCount: Object.keys(dump).length, rowCounts: Object.fromEntries(Object.entries(dump).map(function(pair) {
-    return [pair[0], pair[1].length];
-  })), errors: Object.keys(errors).length ? errors : void 0, tables: dump };
-  const key = "backups/" + timestamp.replace(/[:.]/g, "-") + ".json";
-  const body = JSON.stringify(payload);
-  await env.FILES.put(key, body, { httpMetadata: { contentType: "application/json" } });
-  await pruneOldBackups(env, timestamp);
-  return { key, bytes: body.length, tableCount: payload.tableCount, errors };
-}
-__name(runNightlyBackup, "runNightlyBackup");
-__name2(runNightlyBackup, "runNightlyBackup");
-async function pruneOldBackups(env, nowIso) {
-  try {
-    const cutoff = new Date(Date.parse(nowIso) - BACKUP_RETENTION_DAYS * 24 * 60 * 60 * 1e3);
-    const cutoffKeyFragment = cutoff.toISOString().replace(/[:.]/g, "-");
-    const listed = await env.FILES.list({ prefix: "backups/" });
-    for (const obj of listed.objects || []) {
-      const stamp = obj.key.slice("backups/".length);
-      if (stamp < cutoffKeyFragment) {
-        await env.FILES.delete(obj.key);
-      }
-    }
-  } catch (e) {
-    console.error("backup prune failed", e.message);
-  }
-}
-__name(pruneOldBackups, "pruneOldBackups");
-__name2(pruneOldBackups, "pruneOldBackups");
 function nextMonthlyRenewal(rateLockedUntil, today) {
   const anchor = /* @__PURE__ */ new Date(rateLockedUntil + "T00:00:00Z");
   if (isNaN(anchor.getTime())) return null;
@@ -1019,7 +974,8 @@ async function handleZoomWebhook(request, env) {
     ).bind(genId("zwe"), eventType, payloadHash, objectJson).run();
     const alreadySeen = !(result.meta && result.meta.changes);
     if (alreadySeen) {
-      return json({ received: true, duplicate: true }, 200);
+      const existing = await env.DB.prepare("SELECT processed FROM zoom_webhook_events WHERE payload_hash = ?").bind(payloadHash).first();
+      if (existing?.processed === 1) return json({ received: true, duplicate: true }, 200);
     }
   } catch (e) {
     console.error("zoom webhook idempotency insert failed", e.message);
@@ -1029,11 +985,13 @@ async function handleZoomWebhook(request, env) {
     await reconcileZoomEvent(env, eventType, payload && payload.payload && payload.payload.object);
   } catch (e) {
     console.error("zoom webhook reconciliation failed", eventType, e.message);
+    return errorResponse("Webhook processing failed; retry this event", 503);
   }
   try {
     await env.DB.prepare("UPDATE zoom_webhook_events SET processed = 1 WHERE payload_hash = ?").bind(payloadHash).run();
   } catch (e) {
     console.error("zoom webhook mark-processed failed", e.message);
+    return errorResponse("Webhook acknowledgement failed; retry this event", 503);
   }
   return json({ received: true }, 200);
 }
@@ -2499,7 +2457,7 @@ var worker_default = { async fetch(e, r, t) {
     try {
       const tok = await getZohoAccessToken(r, n.orgId);
       const hostOverride = new URL(e.url).searchParams.get("host");
-      const baseHost = hostOverride || tok.mailApiDomain;
+      const baseHost = diagnosticMailOrigin(tok.mailApiDomain, hostOverride);
       const resp = await fetch(`${baseHost}/api/accounts`, { headers: { "Authorization": `Zoho-oauthtoken ${tok.accessToken}` } });
       const bodyText = await resp.text();
       return withCors(json({ status: resp.status, baseHost, body: bodyText.slice(0, 4e3) }), e);
@@ -2531,7 +2489,7 @@ var worker_default = { async fetch(e, r, t) {
   return withCors(errorResponse("Not found", 404), e);
 }, async scheduled(event, env, ctx) {
   if (event.cron === "*/15 * * * *") {
-    ctx.waitUntil(resumeAuditQueue(env).catch(e=>console.error("Audit queue unavailable",e.message)));
+    ctx.waitUntil(resumeAuditQueue(env).catch(e=>{console.error("Audit queue unavailable",e.message);return logSystemAlert(env,"Audit queue",e.message);}));
     ctx.waitUntil(runAutomationsEngine(env).catch(function(e) {
       console.error("automations engine failed", e.message);
       return logSystemAlert(env, "Automations engine", e.message);
@@ -2568,6 +2526,8 @@ export {
   runContractDeadlineCheck,
   runWeeklyCallPackDrafts,
   runAutomationsEngine,
-  logSystemAlert
+  logSystemAlert,
+  handleZoomWebhook,
+  verifyAccessJwt
 };
 //# sourceMappingURL=worker.js.map

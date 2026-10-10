@@ -11,3 +11,4 @@ tmp/
 *.log
 /*.png
 /audit-detailed-example.html
+public/
