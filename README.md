@@ -22,7 +22,7 @@ Use a current Node.js version with the built-in SQLite module:
 node --test --test-isolation=none "worker/*.test.mjs"
 ```
 
-The October 10 CRM changes passed 502 tests. Administrators see all contacts and can filter or assign them by user; sales staff see assigned contacts only. The release adds confirmed Zoho From addresses, browser history navigation, contact cards and DNC/Not interested statuses, unified Notes with call notes, server duplicate prevention and an administrator call dashboard.
+The October 10 CRM changes passed 505 tests. Administrators see all contacts and can filter or assign them by user; sales staff see assigned contacts only. The release adds confirmed Zoho From addresses, browser history navigation, contact cards and DNC/Not interested statuses, unified Notes with call notes, server duplicate prevention and an administrator call dashboard.
 
 ## Deployment and credentials
 
@@ -34,3 +34,4 @@ Publishing source is separate from changing user permissions, creating invitatio
 
 
 The infrastructure review also hardens Access JWT claims and Zoho diagnostics, retries failed Zoom webhook events, discovers business backup tables automatically, surfaces backup and queue failures, paginates 45-day backup retention, and redacts query strings in Worker logs. Build Pages with `node scripts/build-pages.mjs`; only its explicit frontend list is published. Private business backups exclude active sessions, Zoho OAuth credentials/state and user password hashes. D1 Time Travel is the full-database recovery path; R2 backups do not copy linked external documents.
+

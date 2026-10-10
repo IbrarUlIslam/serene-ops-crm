@@ -1,5 +1,5 @@
 import {runNightlyBackup} from './backups.mjs';
-import {diagnosticMailOrigin} from './provider-safety.mjs';
+import {diagnosticMailOrigin,zohoAccountsOrigin} from './provider-safety.mjs';
 import {handleCallHistory} from './call-history.mjs';
 import {handleContactNotes} from './contact-notes.mjs';
 import {senderAddresses,chooseSender} from './mail-senders.mjs';
@@ -1651,6 +1651,7 @@ __name2(zohoMailApiDomain, "zohoMailApiDomain");
 async function getZohoAccessToken(env, orgId) {
   const row = await getZohoOAuthRow(env, orgId);
   if (!row) throw new Error("Zoho is not connected for this organization");
+  row.accounts_server = zohoAccountsOrigin(row.accounts_server);
   const now = Date.now();
   const expMs = new Date(row.access_token_expires_at).getTime();
   if (Number.isFinite(expMs) && now < expMs - 6e4) {
@@ -1668,7 +1669,8 @@ async function getZohoAccessToken(env, orgId) {
   const resp = await fetch(`${row.accounts_server}/oauth/v2/token`, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: body.toString()
+    body: body.toString(),
+    redirect: "manual"
   });
   const json2 = await resp.json().catch(() => null);
   if (!resp.ok || !json2 || !json2.access_token) {
@@ -1747,7 +1749,9 @@ async function handleZohoOAuthCallback(request, env) {
   if (!Number.isFinite(stateAgeMs) || stateAgeMs > 10 * 60 * 1e3) {
     return Response.redirect("https://crm.sereneop.com/?zoho=error&reason=expired_state", 302);
   }
-  const accountsServer = accountsServerRaw ? accountsServerRaw.replace(/\/$/, "") : "https://accounts.zoho.com";
+  let accountsServer;
+  try { accountsServer = zohoAccountsOrigin(accountsServerRaw || "https://accounts.zoho.com"); }
+  catch (_) { return Response.redirect("https://crm.sereneop.com/?zoho=error&reason=invalid_accounts_server", 302); }
   if (!env.ZOHO_CLIENT_ID || !env.ZOHO_CLIENT_SECRET) {
     return Response.redirect("https://crm.sereneop.com/?zoho=error&reason=not_configured", 302);
   }
@@ -1762,7 +1766,8 @@ async function handleZohoOAuthCallback(request, env) {
   const tokenResp = await fetch(`${accountsServer}/oauth/v2/token`, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: tokenBody.toString()
+    body: tokenBody.toString(),
+    redirect: "manual"
   });
   const tokenJson = await tokenResp.json().catch(() => null);
   if (!tokenResp.ok || !tokenJson || !tokenJson.access_token) {
@@ -2458,7 +2463,7 @@ var worker_default = { async fetch(e, r, t) {
       const tok = await getZohoAccessToken(r, n.orgId);
       const hostOverride = new URL(e.url).searchParams.get("host");
       const baseHost = diagnosticMailOrigin(tok.mailApiDomain, hostOverride);
-      const resp = await fetch(`${baseHost}/api/accounts`, { headers: { "Authorization": `Zoho-oauthtoken ${tok.accessToken}` } });
+      const resp = await fetch(`${baseHost}/api/accounts`, { redirect: "manual", headers: { "Authorization": `Zoho-oauthtoken ${tok.accessToken}` } });
       const bodyText = await resp.text();
       return withCors(json({ status: resp.status, baseHost, body: bodyText.slice(0, 4e3) }), e);
     } catch (err) {
@@ -2528,6 +2533,7 @@ export {
   runAutomationsEngine,
   logSystemAlert,
   handleZoomWebhook,
-  verifyAccessJwt
+  verifyAccessJwt,
+  handleZohoOAuthCallback
 };
 //# sourceMappingURL=worker.js.map
