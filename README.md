@@ -22,7 +22,7 @@ Use a current Node.js version with the built-in SQLite module:
 node --test --test-isolation=none "worker/*.test.mjs"
 ```
 
-The October 10 CRM changes passed 489 tests. Administrators see all contacts and can filter or assign them by user; sales staff see assigned contacts only. The release adds confirmed Zoho From addresses, browser history navigation, contact cards and DNC/Not interested statuses, unified Notes with call notes, server duplicate prevention and an administrator call dashboard.
+The October 10 CRM changes passed 491 tests. Administrators see all contacts and can filter or assign them by user; sales staff see assigned contacts only. The release adds confirmed Zoho From addresses, browser history navigation, contact cards and DNC/Not interested statuses, unified Notes with call notes, server duplicate prevention and an administrator call dashboard.
 
 ## Deployment and credentials
 
