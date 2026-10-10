@@ -1,3 +1,6 @@
+import {handleCallHistory} from './call-history.mjs';
+import {handleContactNotes} from './contact-notes.mjs';
+import {senderAddresses,chooseSender} from './mail-senders.mjs';
 import {decodeSnapshot} from './snapshot-codec.mjs';
 import {attachVisibility,canonicalUsers,scopeSnapshot,mergeScopedWrite,allowedStaffRoute,handleUsers,isPrimaryOwner} from './user-access.mjs';
 import {handleAuditConnectors} from './audit-connectors.mjs';
@@ -389,7 +392,7 @@ async function handleDbBlobRequest(e, r, t, ctx) {
     s.users=await canonicalUsers(r,t.orgId,before.users||[]);
     const o = JSON.stringify(s);
     if (new TextEncoder().encode(o).length > 8388608) return errorResponse("Snapshot too large", 413);
-    let n;try{n=await writeSnapshot(r,t.orgId,o,t.id,previous);}catch(err){if(err.code==='SNAPSHOT_TOO_LARGE')return errorResponse(err.message,413);throw err;}
+    let n;try{n=await writeSnapshot(r,t.orgId,o,t.id,previous);}catch(err){if(err.code==='SNAPSHOT_TOO_LARGE')return errorResponse(err.message,413);if(err.code==='DUPLICATE_CONTACT')return errorResponse(err.message,409);throw err;}
     if(!n)return errorResponse('This workspace changed while saving. Reload before saving to keep everyone’s updates.',409);
     await logActivity(r, t, 'save-snapshot', 'crm_snapshot', t.orgId, null);
     // Queue only a newly opened demo deal or a transition into Demo scheduled.
@@ -2019,6 +2022,9 @@ async function sendUserInvitationMail(actor,message){
   const result=await zohoApiFetch(this,actor.orgId,`/api/accounts/${row.zoho_account_id}/messages`,{method:'POST',json:{fromAddress:row.zoho_email,...message,mailFormat:'html',askReceipt:'no'}});
   if(!result.ok||result.body?.status?.code!==200)throw Error('Invitation mail was not confirmed by Zoho.');
 }
+async function zohoSenderOptions(env,orgId,row){const result=await zohoApiFetch(env,orgId,`/api/accounts/${row.zoho_account_id}`,{method:'GET'});if(!result.ok||result.body?.status?.code&&Number(result.body.status.code)!==200)throw Error('Could not load authorized sender addresses from Zoho.');return senderAddresses(result.body?.data||{},row.zoho_email);}
+async function selectedZohoSender(env,user,row,body){if(!body.fromAddress||String(body.fromAddress).toLowerCase()===String(row.zoho_email).toLowerCase())return row.zoho_email;return chooseSender(body.fromAddress,await zohoSenderOptions(env,user.orgId,row),row.zoho_email);}
+async function handleZohoSenders(request,env,user){try{const row=await requireZohoAccount(env,user.orgId);return json({data:{primary:row.zoho_email,addresses:await zohoSenderOptions(env,user.orgId,row)}});}catch(error){return errorResponse(error.message,409);}}
 async function handleZohoSend(request, env, user) {
   let body;
   try {
@@ -2030,7 +2036,7 @@ async function handleZohoSend(request, env, user) {
   try {
     const row = await requireZohoAccount(env, user.orgId);
     const payload = {
-      fromAddress: row.zoho_email,
+      fromAddress: await selectedZohoSender(env,user,row,body),
       toAddress: body.toAddress,
       ccAddress: body.ccAddress || void 0,
       bccAddress: body.bccAddress || void 0,
@@ -2071,7 +2077,7 @@ async function handleZohoReplyOrForward(request, env, user, messageId) {
   try {
     const row = await requireZohoAccount(env, user.orgId);
     const payload = {
-      fromAddress: row.zoho_email,
+      fromAddress: await selectedZohoSender(env,user,row,body),
       toAddress: body.toAddress,
       ccAddress: body.ccAddress || void 0,
       bccAddress: body.bccAddress || void 0,
@@ -2133,7 +2139,7 @@ async function handleZohoDraftSave(request, env, user) {
     const row = await requireZohoAccount(env, user.orgId);
     const payload = {
       mode: "draft",
-      fromAddress: row.zoho_email,
+      fromAddress: await selectedZohoSender(env,user,row,body),
       toAddress: body.toAddress,
       ccAddress: body.ccAddress || void 0,
       bccAddress: body.bccAddress || void 0,
@@ -2187,7 +2193,7 @@ async function handleZohoDraftSend(request, env, user) {
   try {
     const row = await requireZohoAccount(env, user.orgId);
     const payload = {
-      fromAddress: row.zoho_email,
+      fromAddress: await selectedZohoSender(env,user,row,body),
       toAddress: body.toAddress,
       ccAddress: body.ccAddress || void 0,
       bccAddress: body.bccAddress || void 0,
@@ -2365,6 +2371,8 @@ var worker_default = { async fetch(e, r, t) {
   if (!n) return withCors(errorResponse("No active CRM account found for this Access identity. Contact the Owner/Admin.", 403), e);
   if(s==='/api/users'||s.startsWith('/api/users/'))return withCors(await handleUsers(e,r,n,{sendMail:sendUserInvitationMail.bind(r)}),e);
   if(!n.isOwner&&!allowedStaffRoute(s,e.method,n))return withCors(errorResponse('This section is outside your assigned access. Your assigned work is available in the CRM.',403),e);
+  if(s==='/api/calls/history'&&e.method==='GET')return withCors(await handleCallHistory(e,r,n),e);
+  if(s==='/api/contact-notes')return withCors(await handleContactNotes(e,r,n),e);
   if(s==='/api/contact-archive')return withCors(await handleContactArchive(e,r,n),e);
   if(s.startsWith('/api/sales/contacts/'))return withCors(await handleSalesContactAutosave(e,r,n),e);
   if(s==='/api/call-queue'||s.startsWith('/api/call-queue/'))return withCors(await handleCallQueue(e,r,n),e);
@@ -2390,6 +2398,7 @@ var worker_default = { async fetch(e, r, t) {
   if ("/api/zoho/status" === s && "GET" === e.method) {
     return withCors(await handleZohoStatus(e, r, n), e);
   }
+  if(s==='/api/zoho/mail/senders'&&e.method==='GET')return withCors(await handleZohoSenders(e,r,n),e);
   if ("/api/zoho/mail/folders" === s && "GET" === e.method) {
     return withCors(await handleZohoFolders(e, r, n), e);
   }

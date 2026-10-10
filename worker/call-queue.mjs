@@ -54,7 +54,7 @@ export function nextCallingWindow(contact,at){
  return {...window,error:'calling_window_unavailable',message:'No valid calling window could be calculated. Review the client hours.'};
 }
 const belongs=(r,id)=>(r?.matched_contact_id||r?.contact_id)===id;
-function blockedConsent(contact){const tags=Array.isArray(contact.tags)?contact.tags:String(contact.tags||'').split(',');return !!(contact.consent_withdrawn_at||contact.do_not_call||contact.dnc||contact.call_blocked||contact.doNotCall||norm(contact.consent_status)==='withdrawn'||tags.some(t=>['dnc','do not call','do-not-call'].includes(norm(t))));}
+function blockedConsent(contact){const tags=Array.isArray(contact.tags)?contact.tags:String(contact.tags||'').split(',');return !!(contact.status==='DNC'||contact.consent_withdrawn_at||contact.do_not_call||contact.dnc||contact.call_blocked||contact.doNotCall||norm(contact.consent_status)==='withdrawn'||tags.some(t=>['dnc','do not call','do-not-call'].includes(norm(t))));}
 function blockedCallingPhones(db,now){
  // Consent follows the number across duplicate, archived and historical records.
  // Prepare once for a full queue; no hidden record labels leave this module.
@@ -74,7 +74,7 @@ function blockedCallingPhones(db,now){
  }
  return blocked;
 }
-function restriction(contact,db,now,user,blockedPhones){if(!eligibleContact(contact,user))return ['archived_contact','Archived contacts are excluded from calling.'];if(sample(contact))return ['sample_contact','Fictional samples are excluded from calling.'];if(!normalizedPhone(contact.phone))return ['missing_phone','Add and verify a valid phone number before calling.'];if(contact.consent_withdrawn_at)return ['consent_withdrawn','Calling consent has been withdrawn.'];if(blockedConsent(contact)||(blockedPhones||blockedCallingPhones(db,now)).has(phoneKey(contact.phone)))return ['do_not_call','Calling is restricted for this phone number. Ibrar must review its consent records before calling.'];return null;}
+function restriction(contact,db,now,user,blockedPhones){if(!eligibleContact(contact,user))return ['archived_contact','Archived contacts are excluded from calling.'];if(contact.status==='Not interested')return ['not_interested','This contact is marked Not interested.'];if(sample(contact))return ['sample_contact','Fictional samples are excluded from calling.'];if(!normalizedPhone(contact.phone))return ['missing_phone','Add and verify a valid phone number before calling.'];if(contact.consent_withdrawn_at)return ['consent_withdrawn','Calling consent has been withdrawn.'];if(blockedConsent(contact)||(blockedPhones||blockedCallingPhones(db,now)).has(phoneKey(contact.phone)))return ['do_not_call','Calling is restricted for this phone number. Ibrar must review its consent records before calling.'];return null;}
 function recordedHistory(db,contact,now,meetingRows){
  const calls=(db.calls||[]).filter(r=>belongs(r,contact.id)&&!r.deleted_at&&!r.archived_at&&!automatic(r)&&knownTime(r.at,now)!==null).sort((a,b)=>Date.parse(b.at)-Date.parse(a.at));
  const events=calls.filter(r=>r.outcome==='Connected').map(r=>({at:time(r.at),kind:'conversation'}));let emailCount=0,meetingCount=0;

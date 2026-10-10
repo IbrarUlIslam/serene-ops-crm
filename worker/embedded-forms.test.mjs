@@ -129,25 +129,25 @@ test('Sales role preset selects only its three editable sections and reverting r
   nodes.get('profile').value='sales_associate';nodes.get('profile').onchange();
   for(const id of ['contacts','pipeline','calls']){assert.equal(nodes.get('see-'+id).checked,true,id);assert.equal(nodes.get('edit-'+id).checked,true,id);assert.equal(nodes.get('edit-'+id).disabled,false,id);}
   for(const id of ['today','calendar','clients','work','tickets','activity','social']){assert.equal(nodes.get('see-'+id).checked,false,id);assert.equal(nodes.get('see-'+id).disabled,true,id);}
-  nodes.get('scope').value='all_sales';nodes.get('scope').onchange();assert.match(nodes.get('visibility-help').textContent,/all contacts and deals/);assert.equal(warned(f),true);
+  nodes.get('scope').value='assigned';nodes.get('scope').onchange();assert.match(nodes.get('visibility-help').textContent,/assigned contacts and deals/);assert.equal(warned(f),true);
   nodes.get('profile').value='contributor';nodes.get('profile').onchange();assert.equal(nodes.get('scope').value,'assigned');assert.equal(nodes.get('see-work').checked,true);assert.equal(nodes.get('edit-work').checked,true);assert.equal(warned(f),false);
 });
 
-test('Sales scope can be reverted independently and unsaved role changes block invitation',async()=>{
-  const f=await users({user:{id:'u1',name:'Fictional Sales associate',email:'sales@example.invalid',status:'active',isOwner:false,profile:'sales_associate',scope:'all_sales',sections:['contacts','pipeline','calls'],editSections:['contacts','pipeline','calls']}}),{nodes}=f;
-  assert.equal(warned(f),false);nodes.get('scope').value='assigned';nodes.get('scope').onchange();assert.equal(warned(f),true);const count=f.calls.length;await nodes.get('invite').onclick();assert.equal(f.calls.length,count);assert.match(nodes.get('notice').textContent,/Save these visibility changes/);
-  nodes.get('scope').value='all_sales';nodes.get('scope').onchange();assert.equal(warned(f),false);
+test('Sales scope stays assigned and unsaved role changes block invitation',async()=>{
+  const f=await users({user:{id:'u1',name:'Fictional Sales associate',email:'sales@example.invalid',status:'active',isOwner:false,profile:'sales_associate',scope:'assigned',sections:['contacts','pipeline','calls'],editSections:['contacts','pipeline','calls']}}),{nodes}=f;
+  assert.equal(warned(f),false);nodes.get('scope').value='all_sales';nodes.get('scope').onchange();assert.equal(nodes.get('scope').value,'assigned');assert.equal(warned(f),false);
+  nodes.get('profile').value='contributor';nodes.get('profile').onchange();assert.equal(warned(f),true);const count=f.calls.length;await nodes.get('invite').onclick();assert.equal(f.calls.length,count);assert.match(nodes.get('notice').textContent,/Save these visibility changes/);
 });
 
 test('saving a Sales profile posts explicit scope and three edit permissions without sending an invitation',async()=>{
-  const f=await users(),{nodes}=f;nodes.get('profile').value='sales_associate';nodes.get('profile').onchange();nodes.get('scope').value='all_sales';nodes.get('scope').onchange();let saved;
+  const f=await users(),{nodes}=f;nodes.get('profile').value='sales_associate';nodes.get('profile').onchange();nodes.get('scope').value='assigned';nodes.get('scope').onchange();let saved;
   f.context.fetch=async(path,options)=>{if(options.method==='PUT'){assert.equal(path,'/api/users/u1');saved=JSON.parse(options.body);f.payload.users[0]={...f.payload.users[0],...saved};return json({ok:true,id:'u1',profile:saved.profile,scope:saved.scope});}assert.equal(options.method,'GET');return json(f.payload);};
-  await nodes.get('user-form').onsubmit({preventDefault(){}});assert.equal(saved.profile,'sales_associate');assert.equal(saved.scope,'all_sales');assert.equal(saved.invite,false);assert.deepEqual(saved.sections,['contacts','pipeline','calls']);assert.deepEqual(saved.editSections,['contacts','pipeline','calls']);assert.equal(f.nodes.get('profile').value,'sales_associate');assert.equal(warned(f),false);assert.ok(f.messages.some(item=>item.message.type==='serene-users-updated'));
+  await nodes.get('user-form').onsubmit({preventDefault(){}});assert.equal(saved.profile,'sales_associate');assert.equal(saved.scope,'assigned');assert.equal(saved.invite,false);assert.deepEqual(saved.sections,['contacts','pipeline','calls']);assert.deepEqual(saved.editSections,['contacts','pipeline','calls']);assert.equal(f.nodes.get('profile').value,'sales_associate');assert.equal(warned(f),false);assert.ok(f.messages.some(item=>item.message.type==='serene-users-updated'));
 });
 
 test('failed Sales profile save keeps the role, scope and invitation state in an unsaved draft',async()=>{
-  const f=await users(),{nodes}=f;nodes.get('profile').value='sales_associate';nodes.get('profile').onchange();nodes.get('scope').value='all_sales';nodes.get('scope').onchange();f.context.fetch=async()=>json({error:'Save conflict. Reload and try again.'},409);
-  await nodes.get('user-form').onsubmit({preventDefault(){}});assert.equal(nodes.get('profile').value,'sales_associate');assert.equal(nodes.get('scope').value,'all_sales');assert.equal(warned(f),true);assert.match(nodes.get('notice').textContent,/Save conflict/);assert.equal(nodes.get('invite').disabled,false);
+  const f=await users(),{nodes}=f;nodes.get('profile').value='sales_associate';nodes.get('profile').onchange();nodes.get('scope').value='assigned';nodes.get('scope').onchange();f.context.fetch=async()=>json({error:'Save conflict. Reload and try again.'},409);
+  await nodes.get('user-form').onsubmit({preventDefault(){}});assert.equal(nodes.get('profile').value,'sales_associate');assert.equal(nodes.get('scope').value,'assigned');assert.equal(warned(f),true);assert.match(nodes.get('notice').textContent,/Save conflict/);assert.equal(nodes.get('invite').disabled,false);
 });
 
 test('primary owner access is fixed and new contributor defaults remain unchanged',async()=>{
@@ -192,9 +192,9 @@ test('unconfirmed invitation resend requires Sent mail acknowledgment and retain
 });
 
 test('combined new-user save and invitation require the reviewed Sales recipient approval before any write',async()=>{
-  const f=await users({user:null}),{nodes}=f;nodes.get('name').value='Fictional new Sales user';nodes.get('email').value='newsales@example.invalid';nodes.get('profile').value='sales_associate';nodes.get('profile').onchange();nodes.get('scope').value='all_sales';nodes.get('scope').onchange();let writes=0;
-  f.context.fetch=async(path,options)=>{if(options.method==='POST'){assert.equal(path,'/api/users');writes++;const input=JSON.parse(options.body);assert.equal(input.invite,true);assert.equal(input.email,'newsales@example.invalid');assert.equal(input.scope,'all_sales');assert.deepEqual(input.editSections,['contacts','pipeline','calls']);f.payload.users=[{...input,id:'qa-new',isOwner:false,invitation_status:'sent'}];return json({ok:true,id:'qa-new',invitationStatus:'sent'});}return json(f.payload);};
-  const submit=()=>nodes.get('user-form').onsubmit({preventDefault(){}});const cancelled=submit();assert.match(nodes.get('review-action').textContent,/Create this account/);assert.equal(nodes.get('review-email').textContent,'newsales@example.invalid');assert.equal(nodes.get('review-profile').textContent,'Sales associate');assert.equal(nodes.get('review-scope').textContent,'All active sales contacts and deals');assert.equal(nodes.get('review-sections').children.length,3);assert.equal(writes,0);nodes.get('review-cancel').onclick();await cancelled;assert.equal(writes,0);assert.equal(nodes.get('email').value,'newsales@example.invalid');assert.equal(warned(f),true);
+  const f=await users({user:null}),{nodes}=f;nodes.get('name').value='Fictional new Sales user';nodes.get('email').value='newsales@example.invalid';nodes.get('profile').value='sales_associate';nodes.get('profile').onchange();nodes.get('scope').value='assigned';nodes.get('scope').onchange();let writes=0;
+  f.context.fetch=async(path,options)=>{if(options.method==='POST'){assert.equal(path,'/api/users');writes++;const input=JSON.parse(options.body);assert.equal(input.invite,true);assert.equal(input.email,'newsales@example.invalid');assert.equal(input.scope,'assigned');assert.deepEqual(input.editSections,['contacts','pipeline','calls']);f.payload.users=[{...input,id:'qa-new',isOwner:false,invitation_status:'sent'}];return json({ok:true,id:'qa-new',invitationStatus:'sent'});}return json(f.payload);};
+  const submit=()=>nodes.get('user-form').onsubmit({preventDefault(){}});const cancelled=submit();assert.match(nodes.get('review-action').textContent,/Create this account/);assert.equal(nodes.get('review-email').textContent,'newsales@example.invalid');assert.equal(nodes.get('review-profile').textContent,'Sales associate');assert.equal(nodes.get('review-scope').textContent,'Assigned records only');assert.equal(nodes.get('review-sections').children.length,3);assert.equal(writes,0);nodes.get('review-cancel').onclick();await cancelled;assert.equal(writes,0);assert.equal(nodes.get('email').value,'newsales@example.invalid');assert.equal(warned(f),true);
   const approved=submit();nodes.get('review-approve').onclick();nodes.get('review-approve').onclick();await approved;assert.equal(writes,1);assert.equal(f.nodes.get('email').disabled,true);assert.equal(warned(f),false);
 });
 

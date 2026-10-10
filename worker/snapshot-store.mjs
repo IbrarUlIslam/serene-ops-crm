@@ -1,5 +1,6 @@
 // Snapshot autosaves must compare the version originally read by the caller.
 // The conditional SQL write also rejects a second save that raced the first.
+import {checkedSnapshot} from './contact-integrity.mjs';
 import {encodeSnapshot} from './snapshot-codec.mjs';
 export const snapshotEtag = row => JSON.stringify(row?.updated_at ?? 'empty');
 
@@ -11,7 +12,7 @@ export function checkSnapshotRevision(request, row) {
 }
 
 export async function writeSnapshot(env, orgId, data, userId, previous) {
-  data = await encodeSnapshot(data);
+  data = await encodeSnapshot(await checkedSnapshot(data,previous));
   // Ensure every successful write changes the token, including rapid autosaves.
   const previousTime = Date.parse(previous?.updated_at || '') || 0;
   const stamp = new Date(Math.max(Date.now(), previousTime + 1)).toISOString();

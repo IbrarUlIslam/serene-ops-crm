@@ -140,9 +140,9 @@
       if(primary){$('scope').disabled=true;$('visibility-help').textContent='Ibrar has protected primary ownership and full CRM access.';return;}
       if($('profile').value==='administrator'){$('scope').value='all';$('scope').disabled=true;$('scope-help').textContent='Administrators have full access to the CRM. This does not add them to the Cloudflare infrastructure account.';$('visibility-help').textContent='Full access includes contacts, sales, calls, finance, private notes, audits, documents, connected mail, operations, team records and user administration. Ibrar’s primary owner account stays protected.';for(const section of data.sections){$('see-'+section.id).checked=true;$('see-'+section.id).disabled=true;const edit=$('edit-'+section.id);if(edit){edit.checked=true;edit.disabled=true;}rows.get(section.id).style.opacity='1';sectionLabels.get(section.id).textContent=salesSectionLabel(section);if(editLabels.has(section.id))editLabels.get(section.id).textContent='Administrator access';}return;}
       const sales=$('profile').value==='sales_associate';
-      if(!sales)$('scope').value='assigned';
-      $('scope').disabled=!sales;
-      $('scope-help').textContent=sales ? 'All sales records includes every active contact and deal. Assigned limits sales records to this person’s assignments.' : 'Contributors work with assigned records in the sections you choose.';
+      $('scope').value='assigned';
+      $('scope').disabled=true;
+      $('scope-help').textContent=sales ? 'Sales staff see only their assigned contacts and deals.' : 'Contributors work with assigned records in the sections you choose.';
       $('visibility-help').textContent=sales ? ($('scope').value==='all_sales' ? 'This sales associate can access all contacts and deals in the chosen sales sections.' : 'This sales associate can access assigned contacts and deals in the chosen sales sections.') + ' Financial details, private notes and user administration require administrator access.' : 'Access is limited to assigned records. Viewing a section does not grant access to all clients or other users.';
       for(const section of data.sections){
         const see=$('see-'+section.id),edit=$('edit-'+section.id),allowed=sales?salesSections.includes(section.id):section.id!=='pipeline';

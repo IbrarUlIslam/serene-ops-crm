@@ -28,7 +28,7 @@ export async function handleSalesContactAutosave(request,env,user){
   // Clone only the contact being changed; the other records remain untouched.
   const out={...before,contacts:before.contacts.map(row=>row.id===id?{...row}:row),activity:[...(before.activity||[])]};
   try{mergeSalesWrite(out,before,{contacts:[{id,...input.patch}]},user,{contactAccess:canAccessSalesContact,dealAccess:canAccessSalesDeal});}catch(error){return reply({error:error.message},403);}
-  let stamp;try{stamp=await writeSnapshot(env,user.orgId,out,user.id,previous);}catch(error){if(error.code==='SNAPSHOT_TOO_LARGE')return reply({error:error.message},413);throw error;}
+  let stamp;try{stamp=await writeSnapshot(env,user.orgId,out,user.id,previous);}catch(error){if(error.code==='SNAPSHOT_TOO_LARGE')return reply({error:error.message},413);if(error.code==='DUPLICATE_CONTACT')return reply({error:error.message},409);throw error;}
   if(!stamp)continue;
   return reply({data:{ok:true,updatedAt:stamp},contact:scopedContact(out.contacts.find(row=>row.id===id),out,user)},200,{ETag:JSON.stringify(stamp)});
  }

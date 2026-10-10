@@ -24,7 +24,7 @@ function normalizeContactIntent(supplied,old){
 }
 function validateContact(row,old){
  if(typeof row.name!=='string'||!row.name.trim()||row.name.length>250)throw Error('Enter a contact name.');
- if(row.status!==old?.status&&(['Client','Past client'].includes(old?.status)||!['Not contacted','Contacted','Booked'].includes(row.status)))throw Error('Sales can update prospect status. Client status is controlled by the accepted deal.');
+ if(row.status!==old?.status&&(['Client','Past client'].includes(old?.status)||!['Not contacted','Contacted','Booked','Not interested','DNC'].includes(row.status)))throw Error('Sales can update prospect status. Client status is controlled by the accepted deal.');
  for(const field of SALES_CONTACT_FIELDS)if(Object.hasOwn(row,field)&&!['tags','checks','call_days','timezone_review','call_start','call_end','work_start','work_end','transactions_per_year'].includes(field)&&row[field]!=null&&(typeof row[field]!=='string'||row[field].length>(field==='sales_notes'?8000:field==='email'?254:1000)))throw Error('Enter valid sales contact details.');
  if(row.email&&!/^[^\s@,;<>]+@[^\s@,;<>]+\.[^\s@,;<>]+$/.test(row.email))throw Error('Enter a valid email address.');
  if(row.timezone){try{new Intl.DateTimeFormat('en-US',{timeZone:row.timezone}).format();}catch{throw Error('Choose a valid timezone.');}}

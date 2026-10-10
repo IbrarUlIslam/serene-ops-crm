@@ -22,7 +22,7 @@ function fixture({edits=['contacts','pipeline','calls'],profile='sales_associate
  deals:[{id:'d1',contact_id:'c1',stage:'Demo scheduled',scope_agreed:'PRIVATE PRICE AND SCOPE',checks:{intro:true},sales_notes:'Shared opportunity',tags:['public','owner-private'],meeting_at:'2026-10-10T14:00:00.000Z',meeting_tz:'America/New_York',artifact_type:'CRM snapshot',artifact_minutes:20},{id:'d2',contact_id:'c2',stage:'Initiate',scope_agreed:'',checks:{}}],todos:[],tickets:[],meetings:[],sop_instances:[],checklists:{precall:[],onboarding:[]}};
  c.state={...c.state,authChecked:true,accessUser:user,dbLoadFailed:false,meIdUnresolved:false,meId:'u1',db:c.normalizeScopedWorkspace(scopeSnapshot(full,user)),view:'contacts',contactId:'c1',fStatus:'All',fService:'All',now:Date.parse('2026-10-08T12:00:00Z')};
  c.x=()=>({db:c.state.db,live:c.state.db.contacts,clients:c.state.db.contacts.filter(c=>c.status==='Client'),byId:Object.fromEntries(c.state.db.contacts.map(c=>[c.id,c])),wStart:9,wEnd:17});
- return {c,user,full};
+ return {c,user,full,context};
 }
 const roundTrip=({c,user,full})=>mergeScopedWrite(full,plain(c.workspaceWritePayload()),user);
 const field=(c,label)=>c.contactVals(c.x()).cd.fields.find(row=>row.label===label);
@@ -32,7 +32,7 @@ test('sales identity keeps administrator controls off and navigation restricted 
  assert.deepEqual(plain(model.navGroups.flatMap(g=>g.items.map(i=>i.label))),['Contacts','Pipeline','Calls']);
  for(const section of ['users','command','work','tickets','reports','audits','social','clients','calendar'])assert.equal(c.canView(section),false,section);
  assert.equal(model.canShowContactPanel,true);assert.equal(model.canShowContactModules,false);assert.ok(!model.contactCols.includes('Monthly'));assert.ok(!model.contactCols.includes('Modules'));
- const detail=c.contactVals(c.x()).cd;assert.deepEqual(plain(detail.tabs.map(t=>t.label)),['Details','Deals','Calls','Sales notes']);assert.ok(detail.fields.every(f=>c.salesContactFields().includes(f.key)));
+ const detail=c.contactVals(c.x()).cd;assert.deepEqual(plain(detail.tabs.map(t=>t.label)),['Details','Deals','Notes','Calls']);assert.ok(detail.fields.every(f=>c.salesContactFields().includes(f.key)));
  const rendered=JSON.stringify(plain({...detail,fields:detail.fields.map(f=>({label:f.label,value:f.value}))}));assert.doesNotMatch(rendered,/PRIVATE|Private operator|monthly_override|onboarding_vault/);
 });
 
@@ -42,7 +42,7 @@ test('normalizing a sales snapshot adds no owner defaults, inferred time zone or
 });
 
 test('compact imported contact detail edits save safely and preserve canonical private records and routing tags',()=>{
- const f=fixture(),{c,full}=f;field(c,'Name').onChange({target:{value:'QA edited contact'}});field(c,'Email').onChange({target:{value:'edited@example.invalid'}});field(c,'City').onChange({target:{value:'Washington'}});field(c,'Tags').onChange({target:{value:'public, reviewed'}});field(c,'Sales notes').onChange({target:{value:'Shared updated context'}});
+ const f=fixture(),{c,full}=f;field(c,'Name').onChange({target:{value:'QA edited contact'}});field(c,'Email').onChange({target:{value:'edited@example.invalid'}});field(c,'City').onChange({target:{value:'Washington'}});field(c,'Tags').onChange({target:{value:'public, reviewed'}});field(c,'Notes').onChange({target:{value:'Shared updated context'}});
  const out=roundTrip(f),row=out.contacts.find(c=>c.id==='c1');assert.equal(row.name,'QA edited contact');assert.equal(row.email,'edited@example.invalid');assert.equal(row.city,'Washington');assert.equal(row.sales_notes,'Shared updated context');assert.ok(row.tags.includes('assign-private'));assert.equal(row.timezone,'');assert.equal(row.timezone_review,true);
  assert.equal(row.owner,full.contacts[0].owner);assert.equal(row.notes,full.contacts[0].notes);assert.equal(row.monthly_override,1100);assert.deepEqual(out.contacts.find(c=>c.id==='c2'),full.contacts[1]);
 });
@@ -87,7 +87,7 @@ test('assigned contributor does not inherit Sales editing or Pipeline navigation
 
 test('large compact import shape survives Sales normalization and an unrelated contact edit without fabricated protected fields',()=>{
  const full=fixture().full;full.contacts=Array.from({length:4588},(_,i)=>({id:'qa_import_'+i,name:'QA imported prospect '+i,...(i%7?{email:'qa'+i+'@example.invalid'}:{}),phone:'+1202555'+String(i%10000).padStart(4,'0'),brokerage:'QA Brokerage',owner:'Private operator',state:'',status:'Not contacted',timezone:i<154?'':'America/New_York',...(i<154?{timezone_review:true}:{}),tz_source:i<154?'':'area',call_start:9,call_end:18,tags:['master realtor list','assign-private'],lead_source:'QA import',...(i<885?{source_last_activity:'QA source text, timezone unknown'}:{}),created_at:'2026-10-08T12:00:00Z'}));full.deals=[];const f=fixture({full}),{c}=f;
- const row=c.state.db.contacts.find(row=>!row.email&&row.timezone_review);assert.ok(row,'Compact unknown-zone example exists');c.state.contactId=row.id;c.ensureEnhancements(c.state.db);field(c,'Sales notes').onChange({target:{value:'QA round-trip verification'}});
+ const row=c.state.db.contacts.find(row=>!row.email&&row.timezone_review);assert.ok(row,'Compact unknown-zone example exists');c.state.contactId=row.id;c.ensureEnhancements(c.state.db);field(c,'Notes').onChange({target:{value:'QA round-trip verification'}});
  const out=roundTrip(f);assert.equal(out.contacts.length,full.contacts.length);assert.equal(out.contacts.find(c=>c.id===row.id).sales_notes,'QA round-trip verification');assert.equal(out.contacts.find(c=>c.id===row.id).timezone,'');assert.equal(out.contacts.filter(c=>c.timezone_review).length,full.contacts.filter(c=>c.timezone_review).length);
 });
 
@@ -103,5 +103,23 @@ test('native flush submits a narrow Sales payload and adopts the canonical saved
 });
 
 test('native save errors leave the Sales edit visible and explicitly unsaved',async()=>{
- const {c}=fixture();field(c,'Sales notes').onChange({target:{value:'Keep the unsaved Sales context'}});c._savedEpoch=0;c.apiFetch=async()=>({ok:false,status:409,json:async()=>({error:'Saved data changed. Reload before retrying.'})});await c.flushDb();assert.equal(c.state.saveStatus,'error');assert.equal(c.state.saveConflict,true);assert.match(c.state.saveError,/Reload/);assert.equal(c.state.db.contacts[0].sales_notes,'Keep the unsaved Sales context');assert.ok(c._savedEpoch<c._saveEpoch);
+ const {c}=fixture();field(c,'Notes').onChange({target:{value:'Keep the unsaved Sales context'}});c._savedEpoch=0;c.apiFetch=async()=>({ok:false,status:409,json:async()=>({error:'Saved data changed. Reload before retrying.'})});await c.flushDb();assert.equal(c.state.saveStatus,'error');assert.equal(c.state.saveConflict,true);assert.match(c.state.saveError,/Reload/);assert.equal(c.state.db.contacts[0].sales_notes,'Keep the unsaved Sales context');assert.ok(c._savedEpoch<c._saveEpoch);
+});
+
+
+test('administrator contact filters include all records and bulk assignment updates canonical access IDs',()=>{
+ const {c,full,user}=fixture();c.state.accessUser={...user,isOwner:true};c.state.db=c.ensureEnhancements(structuredClone(full));c.state.fAssignment='all';let view=c.contactsVals(c.x());assert.equal(view.contactRows.length,2);assert.equal(view.ownershipRows.length,2);
+ c.state.modal='bulkcontactowner';c.state.draft={ids:['c1'],owner:user.name};c.saveModal(c.x());const row=c.state.db.contacts[0];assert.equal(row.owner_user_id,user.id);assert.deepEqual(plain(row.assigned_user_ids),[user.id]);assert.equal(c.state.db.deals[0].assignee_user_id,user.id);assert.deepEqual(scopeSnapshot(c.state.db,{...user,visibility:{...user.visibility,scope:'assigned'}}).contacts.map(r=>r.id),['c1']);
+ c.state.fAssignment='u_sales';assert.deepEqual(plain(c.contactsVals(c.x()).contactRows.map(r=>r.id)),['c1']);c.state.fAssignment='all';assert.equal(c.contactsVals(c.x()).contactRows.length,2);
+});
+test('browser history restores the contact and Notes tab without reloading or discarding the signed-in workspace',()=>{
+ const {c,context}=fixture();let listener;const history={state:null,pushState(s){this.state=s;},replaceState(s){this.state=s;}};context.window.history=history;context.window.addEventListener=(name,fn)=>{if(name==='popstate')listener=fn;};context.location.href='https://crm.example.invalid/';c.confirmEmbeddedLeave=()=>true;c.installNavigation();const original=c.state.db;
+ c.openContact('c1','notes');assert.deepEqual(plain(history.state.crmRoute),{view:'contact',contactId:'c1',tab:'notes'});listener({state:{crmRoute:{view:'contacts'}}});assert.equal(c.state.view,'contacts');assert.equal(c.state.authChecked,true);assert.equal(c.state.db,original);listener({state:{crmRoute:{view:'contact',contactId:'c1',tab:'notes'}}});assert.equal(c.state.tab,'notes');assert.equal(c.state.contactId,'c1');
+});
+test('call dashboard counts distinct contacts per caller and deduplicates Zoom records with manual outcomes',()=>{
+ const {c,user,full}=fixture();c.state.accessUser={...user,isOwner:true};const at='2026-10-08T11:00:00Z';full.calls=[{id:'a',contact_id:'c1',by_user_id:'u_sales',at,outcome:'Connected',zoom_call_id:'z1'},{id:'b',contact_id:'c1',by_user_id:'u_sales',at,outcome:'No answer'},{id:'c',contact_id:'c2',by_user_id:'u_sales',at,outcome:'Connected'}];c.state.db=full;c.state.zoomCalls=[{zoom_call_id:'z1',contact_id:'c1',initiated_by_user_id:'u_sales',started_at:at,duration_seconds:60}];const report=c.callDashboard(c.x()),row=report.callReportRows.find(r=>r.name===user.name);assert.equal(report.callReportAdmin,true);assert.equal(row.contacts,2);assert.equal(row.calls,3);assert.equal(row.connected,2);assert.equal(report.callReportUnique,2);
+});
+
+test('complete history counts older Zoom records and leaves unknown operators unattributed',()=>{
+ const {c,user,full}=fixture();c.state.accessUser={...user,isOwner:true};c.state.db=full;c.state.callHistoryDays='7';c.state.callHistoryRows=[{zoom_call_id:'older',contact_id:'c1',initiated_by:'u_sales',created_at:'2026-10-08T11:00:00Z',duration_seconds:60},{zoom_call_id:'unknown',contact_id:'c2',created_at:'2026-10-08T11:00:00Z',duration_seconds:0}];c.state.zoomCalls=[];const report=c.callDashboard(c.x());assert.equal(report.callReportRows.find(r=>r.name===user.name).contacts,1);assert.equal(report.callReportRows.find(r=>r.name==='Private operator').calls,0);assert.match(report.callReportUnattributed,/1 attempts/);assert.equal(report.callReportUnique,2);
 });
