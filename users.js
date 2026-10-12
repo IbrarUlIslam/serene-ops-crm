@@ -3,9 +3,10 @@
   const $ = id => document.getElementById(id);
   const el = (tag, text) => { const e = document.createElement(tag); if (text != null) e.textContent = text; return e; };
   let data, selected = null, busy = false, dirty = false, lockedControls = null, baseline = '', inviteReview = null;
-  const salesSections = ['contacts','pipeline','calls'];
+  const salesSections = ['today','contacts','pipeline','calls'];
+  const salesEdits = ['contacts','pipeline','calls'];
   const contributorDefaults = ['today','calendar','clients','work','tickets','activity'];
-  const salesSectionLabel = section => ({clients:'Clients',calls:'Calls',sops:'SOPs',meetings:'Meetings'}[section.id] || section.label.replace(/^Assigned\s+/i, '').replace(/^./, char => char.toUpperCase()));
+  const salesSectionLabel = section => ({today:'Dashboard',clients:'Clients',calls:'Calls',sops:'SOPs',meetings:'Meetings'}[section.id] || section.label.replace(/^Assigned\s+/i, '').replace(/^./, char => char.toUpperCase()));
   const changed = () => window.sereneEmbeddedChanged?.();
   function draft() {
     return JSON.stringify({name:$('name')?.value.trim() || '',email:($('email')?.value || '').trim().toLowerCase(),status:$('status')?.value || '',profile:$('profile')?.value || 'contributor',scope:$('scope')?.value || 'assigned',invite:!!$('invite-new')?.checked,sections:(data?.sections || []).filter(section => $('see-' + section.id)?.checked).map(section => section.id).sort(),editSections:(data?.sections || []).filter(section => $('edit-' + section.id)?.checked).map(section => section.id).sort()});
@@ -146,8 +147,8 @@
       $('visibility-help').textContent=sales ? ($('scope').value==='all_sales' ? 'This sales associate can access all contacts and deals in the chosen sales sections.' : 'This sales associate can access assigned contacts and deals in the chosen sales sections.') + ' Financial details, private notes and user administration require administrator access.' : 'Access is limited to assigned records. Viewing a section does not grant access to all clients or other users.';
       for(const section of data.sections){
         const see=$('see-'+section.id),edit=$('edit-'+section.id),allowed=sales?salesSections.includes(section.id):section.id!=='pipeline';
-        const editable=allowed&&(sales?salesSections.includes(section.id):['calls','work','tickets','social'].includes(section.id));
-        if(reset){const restoring=$('profile').value===initialProfile;see.checked=(restoring?initialSections:sales?salesSections:contributorDefaults).includes(section.id);if(edit)edit.checked=(restoring?initialEdits:sales?salesSections:[]).includes(section.id);}
+        const editable=allowed&&(sales?salesEdits.includes(section.id):['calls','work','tickets','social'].includes(section.id));
+        if(reset){const restoring=$('profile').value===initialProfile;see.checked=(restoring?initialSections:sales?salesSections:contributorDefaults).includes(section.id);if(edit)edit.checked=(restoring?initialEdits:sales?salesEdits:[]).includes(section.id);}
         if(!allowed){see.checked=false;if(edit)edit.checked=false;}
         if(edit&&!editable)edit.checked=false;
         see.disabled=primary||!allowed;if(edit)edit.disabled=primary||!editable;

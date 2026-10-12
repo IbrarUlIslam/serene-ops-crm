@@ -1,3 +1,4 @@
+import {handleSalesAnalytics} from './sales-analytics.mjs';
 import {runNightlyBackup} from './backups.mjs';
 import {diagnosticMailOrigin,zohoAccountsOrigin} from './provider-safety.mjs';
 import {handleCallHistory} from './call-history.mjs';
@@ -2334,6 +2335,7 @@ var worker_default = { async fetch(e, r, t) {
   if (!n) return withCors(errorResponse("No active CRM account found for this Access identity. Contact the Owner/Admin.", 403), e);
   if(s==='/api/users'||s.startsWith('/api/users/'))return withCors(await handleUsers(e,r,n,{sendMail:sendUserInvitationMail.bind(r)}),e);
   if(!n.isOwner&&!allowedStaffRoute(s,e.method,n))return withCors(errorResponse('This section is outside your assigned access. Your assigned work is available in the CRM.',403),e);
+  if(s==='/api/sales/analytics')return withCors(await handleSalesAnalytics(e,r,n),e);
   if(s==='/api/calls/history'&&e.method==='GET')return withCors(await handleCallHistory(e,r,n),e);
   if(s==='/api/contact-notes')return withCors(await handleContactNotes(e,r,n),e);
   if(s==='/api/contact-archive')return withCors(await handleContactArchive(e,r,n),e);

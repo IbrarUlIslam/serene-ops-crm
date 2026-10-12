@@ -143,7 +143,7 @@ export async function handleCallQueue(request,env,user,services={}){
   if(!reading&&!checking&&!logging&&!claiming&&!releasing)throw fail('Not found.',404);
   if(!canUseCallQueue(user,!reading))throw fail('Calling access is not enabled for your account.',403);
   const body=reading?{}:await input(request),inactivityDays=period(reading?url.searchParams.get('inactivityDays'):body.inactivityDays),now=clock(services),loaded=await load(env,user.orgId,reading),{db,row}=loaded;
-  if(reading){const queue=buildCallQueue(db,user,now,inactivityDays,await meetings(env,user.orgId));if(lowCostMode(env))await applyReservations(env,queue,user,now);return json({...queue,snapshotVersion:row.updated_at??null},200,{ETag:snapshotEtag(row)});}
+  if(reading){const queue=buildCallQueue(db,user,now,inactivityDays,await meetings(env,user.orgId));if(lowCostMode(env))await applyReservations(env,queue,user,now);return json({...queue,dialProvider:isSalesAssociate(user)?'google_voice':'zoom',snapshotVersion:row.updated_at??null},200,{ETag:snapshotEtag(row)});}
   const contact=assignedContact(db,user,body.contactId);
   if(releasing){if(lowCostMode(env))await releaseReservation(env,user.orgId,contact.id,user.id);return json({ok:true});}
   if(claiming&&!lowCostMode(env))throw fail('Contact reservations are not enabled.',409);

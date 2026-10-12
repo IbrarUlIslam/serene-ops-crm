@@ -43,8 +43,9 @@
     const blocked=!idle();$('reserve').hidden=!data?.reservationsEnabled||!selected||!isNow(selected)||!!selected?.reservedByMe;$('release').hidden=!data?.reservationsEnabled||!selected?.reservedByMe;$('reserve').disabled=blocked||!data?.canCall;$('release').disabled=blocked||pendingOutcome();$('refresh').disabled=blocked;$('inactivity').disabled=blocked;$('search').disabled=loading||saving;
     document.querySelectorAll('.queue-client').forEach(button=>button.disabled=blocked);
     $('next').disabled=blocked||!nextAvailable();
+    if($('dial-help'))$('dial-help').hidden=data?.dialProvider!=='google_voice';
     $('dial').disabled=blocked||dialSent||dirty()||!!retryPayload||!embedded||!verified||!data?.canCall||!selectedAvailable||!selected||!isNow(selected);
-    $('dial').textContent=pendingCall?'Requesting call…':dialSent?'Dial request sent':'Call '+noun();
+    $('dial').textContent=pendingCall?'Requesting call…':dialSent?'Dial request sent':data?.dialProvider==='google_voice'?'Call via Google Voice':'Call '+noun();
     $('outcome').disabled=!canLog()||saving||!!pendingCall||!!retryPayload;
     $('notes').readOnly=!canLog()||saving||!!pendingCall||!!retryPayload;$('callback').readOnly=$('notes').readOnly;
     $('save').disabled=!canLog()||blocked;$('discard').disabled=blocked;
@@ -99,7 +100,7 @@
   }
   function startCall(){
     if(!idle()||$('dial').disabled||!selected)return;
-    const requestId=uuid();pendingCall={requestId,contactId:selected.contactId};$('stop-waiting').hidden=true;locks();changed();notice('Checking this '+noun()+' and the CRM phone before calling…');
+    const requestId=uuid();pendingCall={requestId,contactId:selected.contactId};$('stop-waiting').hidden=true;locks();changed();notice('Checking this '+noun()+' before opening the calling app…');
     window.parent.postMessage({type:'serene-call-queue-call',requestId,contactId:selected.contactId,inactivityDays:Number($('inactivity').value)},location.origin);
     callTimer=setTimeout(()=>{if(pendingCall?.requestId!==requestId)return;$('stop-waiting').hidden=false;notice('No confirmation has returned yet. Check the CRM phone before retrying; this screen is still waiting.',true);},30000);
   }

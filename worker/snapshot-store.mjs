@@ -1,3 +1,5 @@
+import {persistSalesActivity} from './sales-activity.mjs';
+import {decodeSnapshot} from './snapshot-codec.mjs';
 // Snapshot autosaves must compare the version originally read by the caller.
 // The conditional SQL write also rejects a second save that raced the first.
 import {checkedSnapshot} from './contact-integrity.mjs';
@@ -12,7 +14,8 @@ export function checkSnapshotRevision(request, row) {
 }
 
 export async function writeSnapshot(env, orgId, data, userId, previous) {
-  data = await encodeSnapshot(await checkedSnapshot(data,previous));
+  const next = await checkedSnapshot(data,previous);
+  data = await encodeSnapshot(next);
   // Ensure every successful write changes the token, including rapid autosaves.
   const previousTime = Date.parse(previous?.updated_at || '') || 0;
   const stamp = new Date(Math.max(Date.now(), previousTime + 1)).toISOString();
@@ -20,5 +23,6 @@ export async function writeSnapshot(env, orgId, data, userId, previous) {
     ? await env.DB.prepare('UPDATE crm_snapshot SET data=?,updated_at=?,updated_by=? WHERE org_id=? AND updated_at IS ?').bind(data, stamp, userId, orgId, previous.updated_at ?? null).run()
     : await env.DB.prepare('INSERT INTO crm_snapshot (org_id,data,updated_at,updated_by) VALUES (?,?,?,?) ON CONFLICT(org_id) DO NOTHING').bind(orgId, data, stamp, userId).run();
   if (!saved.meta?.changes) return null;
+  if(next&&typeof next==='object')await persistSalesActivity(env,orgId,previous?.data?await decodeSnapshot(previous.data):{},next,userId,stamp);
   return stamp;
 }

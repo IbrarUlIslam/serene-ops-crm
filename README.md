@@ -37,3 +37,7 @@ The infrastructure review also hardens Access JWT claims and Zoho diagnostics, r
 
 
 The October 12 navigation fix passed 515 tests. Browser Back stays within the signed-in CRM at the entry page; Back/Forward restore contact tabs and page shortcuts without discarding pending notes. Refresh the frontend once after deployment to load the fix. Authentication expiry and staff access restrictions remain enforced.
+
+The October 12 sales dashboard release passed 537 regression checks. Admins can review current contact assignments and unique contacts worked today, this calendar week or this calendar month, with daily breakdowns by salesperson in Pakistan time. Sales associates receive a read-only Dashboard showing only their own recorded work today; week/month reporting and team data are denied on the server. Apply worker/migrations/20261012_sales_dashboard.sql before deploying the Worker. The activity ledger preserves reporting when snapshot history is trimmed and excludes assignment-only changes, imports, automation and dialer opens.
+
+Sales Call actions use a checked tel link for Google Voice in Chrome; administrators retain Zoom. Each salesperson must enable Google Voice one-click dialing alongside their extension: https://support.google.com/chrome/answer/11397414 . The CRM verifies assigned access, stored phone, calling hours and DNC before handoff. Google Voice does not report call completion through this handoff; outcomes and notes must be saved in the CRM. No actual call, invitation or provider purchase was made during verification.
