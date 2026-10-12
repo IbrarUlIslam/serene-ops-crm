@@ -25,8 +25,8 @@ test('every option loop and change handler is retained',()=>{
   assert.equal((template.match(/<sc-for\b/g)||[]).length,(before.match(/<sc-for\b/g)||[]).length);
   assert.equal((template.match(/sc-camel-on-change=/g)||[]).length,(before.match(/sc-camel-on-change=/g)||[]).length);
   assert.equal((template.match(/<sc-raw-select\b/g)||[]).length,(before.match(/<sc-raw-select\b/g)||[]).length);
-  assert.ok(template.includes('<sc-raw-option value="{{ o }}">{{ o }}</sc-raw-option>'));
-  assert.ok(template.includes('<sc-raw-option value="{{ o.v }}">{{ o.l }}</sc-raw-option>'));
+  assert.ok(template.includes('<sc-raw-option value="{{ o }}" label="{{ o }}">{{ o }}</sc-raw-option>'));
+  assert.ok(template.includes('<sc-raw-option value="{{ o.v }}" label="{{ o.l }}">{{ o.l }}</sc-raw-option>'));
 });
 
 test('contact status options match object label/value bindings',()=>{

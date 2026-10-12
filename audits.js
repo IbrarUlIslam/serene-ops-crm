@@ -1,5 +1,7 @@
 (()=>{
   'use strict';
+  function contactViewLink(name,id){const a=document.createElement('a');a.textContent=name;a.href='/#'+new URLSearchParams({view:'contact',contactId:id,tab:'details'});a.target='_top';a.className='contact-record-link';a.onclick=e=>{if(e.ctrlKey||e.metaKey||e.shiftKey||e.altKey||e.button>0)return;if(window.parent!==window){e.preventDefault();window.parent.postMessage({type:'serene-open-contact',contactId:id,tab:'details'},location.origin);}};return a;}
+
   const $=id=>document.getElementById(id);
   const el=(tag,text)=>{const node=document.createElement(tag);if(text!=null)node.textContent=text;return node;};
   const sources={instagram:'Instagram',facebook:'Facebook',website:'Agent website',brokerage:'Brokerage',zillow:'Zillow',realtor:'Realtor.com',listing:'Individual listing'};
@@ -57,7 +59,7 @@
   function renderDetail(){
     dirty=false;researchDirty=false;meetingBaseline='';researchBaseline='';
     if(!current){$('detail').replaceChildren(el('p','Select a contact to review their audit.'));changed();return;}
-    $('detail').replaceChildren($('case-template').content.cloneNode(true));$('contact-name').textContent=current.contact.name;$('case-status').textContent=states[current.status]||current.status;
+    $('detail').replaceChildren($('case-template').content.cloneNode(true));$('contact-name').replaceChildren(contactViewLink(current.contact.name,current.contact_id));$('case-status').textContent=states[current.status]||current.status;
     $('sample-notice').hidden=!current.sample;$('sample-answers').hidden=!current.sample;$('sample-answers').onclick=fillSampleAnswers;$('research-panel').hidden=!!current.sample;
     for(const report of current.reports||[]){const row=el('div');row.className='report';const link=el('a',report.kind==='pre'?'Open pre-meeting audit':'Open full audit and proposal');link.href='/api/audits/reports/'+encodeURIComponent(report.id);link.target='_blank';link.rel='noopener';row.append(link,el('small',new Date(report.created_at).toLocaleString('en-US')));$('reports').append(row);}if(!current.reports?.length)$('reports').append(el('p','The pre-meeting document will appear when research finishes.'));
     $('refresh-report').onclick=()=>action(async()=>{syncDirty();if(dirty)throw Error('Save meeting answers first.');if(researchDirty)throw Error('Collect the entered research fields before regenerating, or refresh to discard them.');message('Generating a new pre-meeting document from saved evidence…');await api('/'+current.id+'/refresh-report','POST',{revision:current.revision});notifyDocuments();await load(false);message('New pre-meeting version generated from saved evidence.');});

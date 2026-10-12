@@ -1,5 +1,7 @@
 (()=>{
   'use strict';
+  function contactViewLink(name,id){const a=document.createElement('a');a.textContent=name;a.href='/#'+new URLSearchParams({view:'contact',contactId:id,tab:'details'});a.target='_top';a.className='contact-record-link';a.onclick=e=>{if(e.ctrlKey||e.metaKey||e.shiftKey||e.altKey||e.button>0)return;if(window.parent!==window){e.preventDefault();window.parent.postMessage({type:'serene-open-contact',contactId:id,tab:'details'},location.origin);}};return a;}
+
   const $=id=>document.getElementById(id);
   const el=(tag,text)=>{const node=document.createElement(tag);if(text!=null)node.textContent=text;return node;};
   const outcomes=['Connected','Voicemail','No answer','Call back later','Wrong number','Do not call'];
@@ -67,7 +69,7 @@
   function fact(label,value,detail){const node=el('div');node.className='queue-fact';node.append(el('small',label),el('strong',value));if(detail)node.append(el('span',detail));$('client-facts').append(node);}
   function renderDetail(){
     $('empty-detail').hidden=!!selected;$('client-card').hidden=!selected;if(!selected){locks();changed();return;}
-    $('client-name').textContent=selected.name;$('client-phone').textContent=selected.phone||'Phone number missing';
+    $('client-name').replaceChildren(contactViewLink(selected.name,selected.contactId));$('client-phone').textContent=selected.phone||'Phone number missing';
     const now=isNow(selected),review=!!data?.review.some(row=>row.contactId===selected.contactId);
     $('availability').textContent=selected.reservedByMe?'Reserved by you':!selectedAvailable?'No longer queued':now?'Available now':review?'Review details':'Available later';$('availability').className='queue-badge'+(now?' now':review?' review':'');
     $('client-facts').replaceChildren();if(sales())fact('Sales status',selected.status||'Not recorded');fact(sales()?'Contact history':'Meaningful inactivity',inactivity(selected),selected.lastMeaningfulAt?'Last meaningful contact '+(localTime(selected.lastMeaningfulAt,'Asia/Karachi')||selected.lastMeaningfulAt):selected.historyLabel||'A connected conversation or verified client interaction resets this clock.');

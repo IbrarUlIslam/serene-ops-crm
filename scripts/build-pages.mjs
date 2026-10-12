@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
-export const FRONTEND_FILES=['index.html','brand.css','workspace-screens.css','embedded.js','audits.html','audits.js','audits.css','audit-connectors.html','audit-connectors.js','audit-connectors.css','audit-connectors-nav.js','call-queue.html','call-queue.js','call-queue.css','users.html','users.js','_headers','assets/serene-logo.png','assets/source-sans-3-latin.woff2','assets/source-serif-4-latin.woff2'];
+export const FRONTEND_FILES=['index.html','brand.css','crm-layout.css','workspace-screens.css','embedded.js','audits.html','audits.js','audits.css','audit-connectors.html','audit-connectors.js','audit-connectors.css','audit-connectors-nav.js','call-queue.html','call-queue.js','call-queue.css','users.html','users.js','_headers','assets/serene-logo.png','assets/source-sans-3-latin.woff2','assets/source-serif-4-latin.woff2'];
 export function buildPages(root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..')){
   const destination=path.join(root,'public');
   // Refuse unexpected output files instead of accidentally publishing them.

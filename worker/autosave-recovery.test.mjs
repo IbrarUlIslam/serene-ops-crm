@@ -15,7 +15,7 @@ function fixture(){
 }
 const json=(value,status=200)=>new Response(JSON.stringify(value),{status,headers:{'Content-Type':'application/json',ETag:'"after"'}});
 test('notes save on typing and never turn an HTML200 page into a saved acknowledgement',async()=>{
- assert.match(template,/sc-camel-on-input="\{\{ cd\.onSalesNotes \}\}"/);
+ assert.match(template,/sc-camel-on-input="\{\{ cd\.onNoteDraft \}\}"/);
  const {c}=fixture();c.apiFetch=async()=>new Response('<!DOCTYPE html><html>Sign in</html>',{headers:{'Content-Type':'text/html'}});c.patch('contacts','c1','sales_notes','Keep my conversation notes');await c.flushDb();assert.equal(c._savedEpoch,0);assert.equal(c.state.db.contacts[0].sales_notes,'Keep my conversation notes');assert.equal(c.state.saveStatus,'error');assert.doesNotMatch(c.state.saveError,/Unexpected token|DOCTYPE/);assert.equal(c.state.saveConflict,false);
 });
 test('a temporary HTML503 keeps notes pending and retries with the same protected workspace revision',async()=>{

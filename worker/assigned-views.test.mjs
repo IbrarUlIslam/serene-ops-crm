@@ -48,7 +48,7 @@ test('work-only staff get their task and minimal context, with no contact, calen
 
 test('clients-only staff can open assigned details without commercial or removed workflow traces',()=>{
   const {c}=fixture(['clients']);const values=c.renderVals();assert.equal(values.clientCards.length,1);assert.equal(values.clientCards[0].value,'');assert.doesNotMatch(values.clientsSummary,/\$|recurring/);assert.equal(values.clientTimeColumns,'1fr');assert.equal(values.canShowClientSide,false);assert.equal(values.canShowDelivery,false);
-  values.clientCards[0].go();const detail=c.renderVals();assert.equal(c.state.view,'contact');assert.equal(detail.cd.tDetails,true);assert.deepEqual(plain(detail.cd.tabs.map(t=>t.label)),['Details','Documents']);
+  values.clientCards[0].go();assert.equal(c.state.view,'clients');assert.equal(c.state.drawerId,'c1');c.renderVals().dw.open();const detail=c.renderVals();assert.equal(c.state.view,'contact');assert.equal(detail.cd.tDetails,true);assert.deepEqual(plain(detail.cd.tabs.map(t=>t.label)),['Details','Documents']);
   assert.ok(!detail.cd.glance.some(g=>['Monthly','Notice','Deal stage','Open work','Hours logged','Open tickets','Reminders','Last touch'].includes(g.k)));
   assert.match(conditionsAt('{{ cd.moduleTotal }}'),/canManageRecords/);assert.match(conditionsAt('{{ cd.meetings }}'),/canShowMeetings/);assert.match(conditionsAt('{{ c.stateStyle }}'),/canShowDelivery/);
   c.openDrawer('c1');const drawer=c.renderVals();assert.deepEqual(plain(drawer.dw.glance.map(g=>g.k)),['Owner']);drawer.dw.onPhone({target:{value:'changed'}});assert.equal(c.state.db.contacts[0].phone,'+15550001111');
