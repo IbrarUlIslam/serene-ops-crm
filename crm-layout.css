@@ -1,4 +1,5 @@
 /* Main CRM only: embedded pages have their own structural stylesheet. */
+html,body,.crm-content{overflow-anchor:none}
 .crm-view-link{color:inherit;text-decoration:none;cursor:pointer;min-width:0;overflow-wrap:anywhere}
 .crm-view-link:hover{text-decoration:underline;text-underline-offset:3px}
 .crm-view-link:focus-visible{outline:2px solid var(--action-deep);outline-offset:4px}
@@ -59,4 +60,9 @@ main [style*="display:grid"]{min-width:0}
 main [style*="display:grid"]>*{min-width:0}
 main [style*="display:flex"]{min-width:0}
 main [style*="display:flex"][style*="margin-bottom:16px"]{flex-wrap:wrap}
+.crm-zone-grid{grid-template-columns:repeat(6,minmax(0,1fr))!important}
+.crm-zone-grid>div{padding:20px 14px!important;border-bottom:1px solid var(--rule-soft)}
+.crm-call-report-grid{grid-template-columns:repeat(auto-fit,minmax(180px,1fr))!important}
+@media(max-width:1199px){.crm-zone-grid{grid-template-columns:repeat(3,minmax(0,1fr))!important}}
+@media(max-width:699px){.crm-zone-grid{grid-template-columns:repeat(2,minmax(0,1fr))!important}.crm-call-report-grid{grid-template-columns:repeat(2,minmax(0,1fr))!important}}
 @media(max-width:900px){.command-panel[aria-label="Sales activity dashboard"]{padding:18px!important}.sales-row{gap:14px}.crm-contact-sequence>span{margin-left:0}.crm-filter-panel select{flex:1 1 160px}.crm-contact-preview{width:420px!important}.crm-note-actions>span{width:100%}}
