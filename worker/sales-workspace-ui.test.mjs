@@ -27,9 +27,9 @@ function fixture({edits=['contacts','pipeline','calls'],profile='sales_associate
 const roundTrip=({c,user,full})=>mergeScopedWrite(full,plain(c.workspaceWritePayload()),user);
 const field=(c,label)=>c.contactVals(c.x()).cd.fields.find(row=>row.label===label);
 
-test('sales identity keeps administrator controls off and navigation restricted to three sales sections',()=>{
+test('sales identity keeps administrator controls off with sales sections and personal settings only',()=>{
  const {c}=fixture(),model=c.renderVals();assert.equal(c.isContributor(),true);assert.equal(model.canManageRecords,false);assert.equal(model.canManageSalesContact,true);assert.equal(model.canManageSalesDeal,true);
- assert.deepEqual(plain(model.navGroups.flatMap(g=>g.items.map(i=>i.label))),['Contacts','Pipeline','Calls']);
+ assert.deepEqual(plain(model.navGroups.flatMap(g=>g.items.map(i=>i.label))),['Contacts','Pipeline','Calls','My settings']);
  for(const section of ['users','command','work','tickets','reports','audits','social','clients','calendar'])assert.equal(c.canView(section),false,section);
  assert.equal(model.canShowContactPanel,true);assert.equal(model.canShowContactModules,false);assert.ok(!model.contactCols.includes('Monthly'));assert.ok(!model.contactCols.includes('Modules'));
  const detail=c.contactVals(c.x()).cd;assert.deepEqual(plain(detail.tabs.map(t=>t.label)),['Details','Deals','Notes','Calls']);assert.ok(detail.fields.every(f=>c.salesContactFields().includes(f.key)));
