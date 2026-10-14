@@ -1,6 +1,6 @@
 import {startDerivedSop} from './work-transitions.mjs';
 export const DEAL_STAGES=['Demo scheduled','Audit sent','Pre-meeting prep','No show','Meeting held','Post-meeting audit sent','Initiate','Contract sent','Closed won','Closed lost'];
-export const SALES_CONTACT_FIELDS=['name','brokerage','email','phone','city','state','timezone','timezone_review','tz_source','timezone_source','lead_source','status','call_start','call_end','call_days','tags','sales_notes','transactions_per_year','work_start','work_end'];
+export const SALES_CONTACT_FIELDS=['name','brokerage','email','phone','country','country_code','phone_country_code','city','state','timezone','timezone_review','tz_source','timezone_source','lead_source','status','call_start','call_end','call_days','tags','sales_notes','transactions_per_year','work_start','work_end'];
 export const SALES_DEAL_FIELDS=['stage','meeting_at','meeting_tz','prep_due_at','artifact_type','artifact_minutes','next_action_at','lost_reason','checks','tags','sales_notes'];
 const contactKeys=['id',...SALES_CONTACT_FIELDS,'created_at','updated_at'];
 const dealKeys=['id','contact_id',...SALES_DEAL_FIELDS,'stage_at','created_at','updated_at','no_show_count'];

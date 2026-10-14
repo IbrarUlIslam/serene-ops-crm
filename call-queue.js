@@ -6,7 +6,7 @@
   const el=(tag,text)=>{const node=document.createElement(tag);if(text!=null)node.textContent=text;return node;};
   const outcomes=['Connected','Voicemail','No answer','Call back later','Wrong number','Do not call'];
   const embedded=window.parent!==window;
-  let data=null,selected=null,version=null,verified=false,loading=false,saving=false,pendingCall=null,callTimer=null,dialSent=false,attemptKey=null,retryPayload=null,baseline='',selectedAvailable=false;
+  let lastCountry='All',data=null,selected=null,version=null,verified=false,loading=false,saving=false,pendingCall=null,callTimer=null,dialSent=false,attemptKey=null,retryPayload=null,baseline='',selectedAvailable=false;
   const changed=()=>window.sereneEmbeddedChanged?.();
   const draft=()=>JSON.stringify({outcome:$('outcome').value,note:$('notes').value.trim(),callback:['Connected','Call back later'].includes($('outcome').value)?$('callback').value:''});
   const dirty=()=>!!selected&&draft()!==baseline;
@@ -17,7 +17,9 @@
   const noun=()=>sales()?'contact':'client';
   const isNow=row=>!!data?.available.some(item=>item.contactId===row.contactId);
   const canLog=()=>verified&&!!data?.canLog&&!selected?.reasonCodes?.includes('reserved')&&(selectedAvailable||dialSent||!!retryPayload);
-  const nextAvailable=()=>{const available=data?.available||[],index=available.findIndex(row=>row.contactId===selected?.contactId);return index>=0?available[index+1]||null:available.find(row=>row.contactId!==selected?.contactId)||null;};
+  const countryLabels={GB:'United Kingdom (+44)',US:'United States (+1)',CA:'Canada (+1)',NANP:'US / Canada (+1)',IE:'Ireland (+353)',AU:'Australia (+61)',IN:'India (+91)',PK:'Pakistan (+92)',Unknown:'Unknown / no number'};
+  const matchesFilter=row=>(!$('country').value||$('country').value==='All'||(row.phoneCountry||'Unknown')===$('country').value)&&[row.name,row.phone,row.country].filter(Boolean).join(' ').toLowerCase().includes($('search').value.trim().toLowerCase());
+  const nextAvailable=()=>{const available=(data?.available||[]).filter(matchesFilter),index=available.findIndex(row=>row.contactId===selected?.contactId);return index>=0?available[index+1]||null:available.find(row=>row.contactId!==selected?.contactId)||null;};
   const uuid=()=>crypto.randomUUID();
   function notice(text,error=false){$('notice').textContent=text;$('notice').classList.toggle('error',error);}
   function parseVersion(response,value){const supplied=value.snapshotVersion;if(supplied)return String(supplied).startsWith('"')?String(supplied):JSON.stringify(supplied);return String(response.headers.get('ETag')||'').replace(/^W\//,'')||null;}
@@ -47,7 +49,7 @@
     $('next').disabled=blocked||!nextAvailable();
     if($('dial-help'))$('dial-help').hidden=data?.dialProvider!=='google_voice';
     $('dial').disabled=blocked||dialSent||dirty()||!!retryPayload||!embedded||!verified||!data?.canCall||!selectedAvailable||!selected||!isNow(selected);
-    $('dial').textContent=pendingCall?'Requesting call…':dialSent?'Dial request sent':data?.dialProvider==='google_voice'?'Call via Google Voice':'Call '+noun();
+    $('dial').textContent=pendingCall?'Requesting call…':dialSent?'Dial request sent':data?.dialProvider==='google_voice'?'Call via Google Voice':'Call via Zoom';
     $('outcome').disabled=!canLog()||saving||!!pendingCall||!!retryPayload;
     $('notes').readOnly=!canLog()||saving||!!pendingCall||!!retryPayload;$('callback').readOnly=$('notes').readOnly;
     $('save').disabled=!canLog()||blocked;$('discard').disabled=blocked;
@@ -59,9 +61,9 @@
   function callback(row){if(!row.callbackAt)return '';const at=new Date(row.callbackAt).getTime(),now=new Date(data.serverNow).getTime();return at<=now?'Callback due':'Callback '+(localTime(row.callbackAt,'Asia/Karachi')||'scheduled');}
   function timing(row){if(isNow(row))return Number.isFinite(row.windowClosingMinutes)?'Closes in '+Math.max(0,Math.floor(row.windowClosingMinutes))+' min':row.closesPKT?'Closes '+row.closesPKT+' PKT':'Within calling hours';return row.opensPKT?'Opens '+row.opensPKT+' PKT':row.opensAt?'Opens '+localTime(row.opensAt,'Asia/Karachi'):(row.reasons||[]).join(' · ')||'Details need review';}
   function renderLists(){
-    const query=$('search').value.trim().toLowerCase();
+    const query=$('search').value.trim().toLowerCase(),country=$('country').value||'All',codes=[...new Set(rows().map(r=>r.phoneCountry||'Unknown'))].sort();if(country!=='All'&&!codes.includes(country))codes.push(country);$('country').replaceChildren();for(const code of ['All',...codes]){const option=el('option',code==='All'?'All phone countries':countryLabels[code]||code);option.value=code;$('country').append(option);}$('country').value=country;
     for(const [bucket,target] of [['available','now'],['upcoming','later'],['review','review']]){
-      const list=$(target+'-list');list.replaceChildren();const values=(data?.[bucket]||[]).filter(row=>row.name.toLowerCase().includes(query));$(target+'-count').textContent=values.length;
+      const list=$(target+'-list');list.replaceChildren();const values=(data?.[bucket]||[]).filter(matchesFilter);$(target+'-count').textContent=values.length;
       for(const row of values){const button=el('button');button.type='button';button.className='queue-client';button.setAttribute('aria-pressed',String(selected?.contactId===row.contactId));button.append(el('strong',row.name),el('small',[inactivity(row),callback(row)].filter(Boolean).join(' · ')),el('small',timing(row)));button.onclick=()=>{if(canLeave()){select(row);notice('Review '+row.name+' before choosing the next step.');}};list.append(button);}
       if(!values.length){const empty=el('p',query?'No matching '+noun()+'s.':bucket==='available'?'No '+noun()+'s can be called now.':bucket==='upcoming'?'No later calling windows.':'No details need review.');empty.className='queue-list-empty';list.append(empty);}
     }
@@ -76,6 +78,7 @@
     fact(sales()?'Contact local time':'Client local time',selected.localNow||'Time zone needs review',selected.timezone||'No confirmed time zone');
     fact(now?'Window closes · PKT':'Next opening · PKT',now?(selected.closesPKT||localTime(selected.closesAt,'Asia/Karachi')||'Not available'):(selected.opensPKT||localTime(selected.opensAt,'Asia/Karachi')||'Not available'),now?(selected.closesLocal||localTime(selected.closesAt,selected.timezone)):(selected.opensLocal||localTime(selected.opensAt,selected.timezone)));
     fact('Callback',callback(selected)||'None scheduled',selected.callbackAt?localTime(selected.callbackAt,selected.timezone):null);
+    fact('Phone country',countryLabels[selected.phoneCountry]||selected.phoneCountry||'Unknown',selected.country?'Contact country: '+selected.country:null);
     fact('Last call attempt',selected.lastAttemptAt?(localTime(selected.lastAttemptAt,'Asia/Karachi')||selected.lastAttemptAt):'No recorded attempt','An attempt alone is not a meaningful conversation.');
     const reasons=(selected.reasons||[]).join(' ');$('next-step').textContent=!selectedAvailable?(dialSent?'This '+noun()+' is no longer in the refreshed queue. Record the actual outcome of the completed call, or explicitly discard the pending outcome.':'This '+noun()+' is no longer in the refreshed queue. Copy or discard your draft before choosing another '+noun()+'.'):review?(reasons||'Confirm the phone number and time zone before calling.'):now?(callback(selected).startsWith('Callback due')?'The callback is due and the '+noun()+' is within calling hours. Review the context, then call.':selected.firstSalesOutreach?'The prospect is within calling hours. Review the context and recorded attempts, then make a sales call.':'The '+noun()+' is within calling hours. Review the context, then make a call.'):(reasons||'Wait until the next opening before placing a call.');
     if(selected.reservedUntil)fact('Reservation',selected.reservedByMe?'Reserved by you':'Reserved by another associate','Expires '+localTime(selected.reservedUntil,'Asia/Karachi'));
@@ -88,14 +91,14 @@
     try{
       const result=await api('?inactivityDays='+encodeURIComponent(filter));
       if(!Array.isArray(result.value.available)||!Array.isArray(result.value.upcoming)||!Array.isArray(result.value.review))throw Error('The queue response was incomplete. Refresh and try again.');
-      data=result.value;version=result.version;verified=true;$('inactivity').value=String(data.inactivityDays);const refreshed=rows().find(row=>row.contactId===selectedId);
+      data=result.value;const chosen=new URLSearchParams(location.search).get('provider');if(['zoom','google_voice'].includes(chosen))data.dialProvider=chosen;version=result.version;verified=true;$('inactivity').value=String(data.inactivityDays);const refreshed=rows().find(row=>row.contactId===selectedId);
       $('queue-title').textContent='Next to call';document.title=$('queue-title').textContent+' | Serene Ops';$('queue-eyebrow').textContent='SERENE OPS / CALLING LIST';$('queue-description').textContent='All permitted contacts, ordered around their local calling hours. Schedule follow-ups using a reminder or task.';
       $('period-label').textContent='Contact activity';$('search-label').textContent='Find a '+noun();$('search').placeholder=(sales()?'Contact':'Client')+' name';$('detail-eyebrow').textContent='CONTACT';$('detail').setAttribute('aria-label','Selected '+noun());$('next').textContent='Next '+noun();$('empty-detail').textContent='Choose a '+noun()+' to review their calling window and next step.';
       $('queue-list').setAttribute('aria-label','Calling list');$('callback-hint').textContent='The queue checks the '+noun()+'’s calling hours before a future call.';
       $('scope').textContent=(data.canCall?(sales()?(['all_sales','all_contacts'].includes(data.contactScope)?'All permitted contacts appear.':'Only your assigned contacts appear.'):'Only your permitted active clients appear.'):'View only · calling and logging are unavailable with your current access.')+' Follow-ups are scheduled with reminders or tasks.';
       $('coverage').textContent=(data.historyCoverage?.label||'Meaningful follow-up uses recorded conversations and verified client interactions.')+(sales()?' First recorded prospect outreach is not delayed by contact creation. Subsequent meaningful contact respects the selected spacing.':' A missed call does not reset the inactivity clock.');
       if(preserve){if(refreshed)selected=refreshed;selectedAvailable=!!refreshed;renderLists();renderDetail();}
-      else select(refreshed||data.available[0]||data.upcoming[0]||data.review[0]||null);
+      else select(refreshed&&matchesFilter(refreshed)?refreshed:data.available.find(matchesFilter)||data.upcoming.find(matchesFilter)||data.review.find(matchesFilter)||null);
       notice(preserve?(dialSent?'Queue refreshed. Record the actual outcome of the existing dial request.':'Queue refreshed. Your outcome draft is retained.'):rows().length?'Choose a '+noun()+', review the calling window, then call or record an actual outcome.':sales()?'No contacts meet this calling list’s criteria.':'No active clients meet this queue’s follow-up criteria.');return true;
     }catch(error){verified=false;if(data)$('inactivity').value=String(data.inactivityDays);notice(error.message,true);return false;}
     finally{loading=false;locks();changed();}
@@ -134,6 +137,7 @@
     }finally{saving=false;locks();changed();}
   }
   for(const outcome of outcomes){const option=el('option',outcome);option.value=outcome;$('outcome').append(option);}
+  $('country').onchange=()=>{if(!idle()){ $('country').value=lastCountry;return;}if(pendingOutcome()&&!canLeave()){$('country').value=lastCountry;renderLists();return;}lastCountry=$('country').value;const next=(data?.available||[]).find(matchesFilter)||(data?.upcoming||[]).find(matchesFilter)||(data?.review||[]).find(matchesFilter);select(next||null);};
   $('outcome').onchange=draftChanged;$('notes').oninput=draftChanged;$('callback').oninput=draftChanged;
   $('outcome-form').onsubmit=saveOutcome;$('dial').onclick=startCall;$('search').oninput=()=>{renderLists();locks();};
   $('next').onclick=()=>{const next=nextAvailable();if(!next||!canLeave())return;select(next);notice('Review '+next.name+' before choosing the next step.');};

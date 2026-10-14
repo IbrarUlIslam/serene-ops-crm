@@ -66,3 +66,5 @@ main [style*="display:flex"][style*="margin-bottom:16px"]{flex-wrap:wrap}
 @media(max-width:1199px){.crm-zone-grid{grid-template-columns:repeat(3,minmax(0,1fr))!important}}
 @media(max-width:699px){.crm-zone-grid{grid-template-columns:repeat(2,minmax(0,1fr))!important}.crm-call-report-grid{grid-template-columns:repeat(2,minmax(0,1fr))!important}}
 @media(max-width:900px){.command-panel[aria-label="Sales activity dashboard"]{padding:18px!important}.sales-row{gap:14px}.crm-contact-sequence>span{margin-left:0}.crm-filter-panel select{flex:1 1 160px}.crm-contact-preview{width:420px!important}.crm-note-actions>span{width:100%}}
+
+.crm-calling-preference{display:flex;flex-direction:column;gap:6px;padding:12px 8px 4px;font-size:12px;font-weight:600;color:var(--ink)}.crm-calling-preference select{width:100%;padding:8px;border:1px solid var(--rule);border-radius:2px;background:#fff;color:var(--ink);font:inherit}.crm-calling-preference span{font-size:11px;font-weight:400;line-height:1.4;color:var(--ink-muted)}
